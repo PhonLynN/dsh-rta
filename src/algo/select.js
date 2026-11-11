@@ -24,6 +24,15 @@ export const DEFAULT_SELECT = Object.freeze({
   // 结构闸门：只有「版面/配色整体变化」才算切镜，滚动和视频运动不算。
   cutBFrac: 0.40,      // 分块差占比 ≥40%（块均值差 >30）
   cutHist: 0.20,       // HSV 直方图 L1 ≥20%
+  // 绝对分数窗口闸门：lumaGain 对暗色界面会把分数放大到 3×，5s 滚动基线的 z 在
+  // 稀疏尖峰下也会失真（median≈0 → z≈norm）。所以 cut 还要求最近 1s 内出现过
+  // 绝对高分；播放模式再抬高。真实切镜 score 中位 ~64，视频帧 p50 <1，区分度足够。
+  cutMinRawScore: 22,
+  cutMinRawB15: 0.50,
+  backoffCutMinRawScore: 35,
+  backoffCutMinRawB15: 0.60,
+  rawWindowMs: 1000,
+  gainMax: 2,          // lumaGain 上限，避免暗色界面把整帧分数放大 3×
   // 滚动判定：行位移可解释 + 补偿后残差低
   scrollShift: 6,      // 行位移 ≥6px
   scrollCorr: 0.55,    // 行亮度剖面相关 ≥0.55
@@ -66,7 +75,11 @@ export function createSelector(opts = {}) {
   let integral = 0;
   let textPending = false;
   let lastScore = 0;
+  let lastKind = null;
   const motionAt = []; // 最近 1s 内判为运动/滚动的 tick 时间（播放模式退避用）
+  const rawWin = [];   // 最近 rawWindowMs 内的原始分数/版面变化（绝对分数窗口闸门用）
+  let lastRawMaxScore = 0;
+  let lastRawMaxB15 = 0;
 
   const prune = (t) => {
     while (recent.length && t - recent[0] > 60_000) recent.shift();
@@ -98,8 +111,11 @@ export function createSelector(opts = {}) {
     ingest(sample) {
       const t = sample.t;
       if (!startedAt) startedAt = t;
+      // 采样断档（哨兵卡帧 / 系统休眠）后的「重同步帧」不是真实切镜：分数会因为时间缺口
+      // 突然跳高（实测 index 反复记 score=43、mc=0.87 而实际画面没变）。跳过判定，不污染统计。
+      if (sample.resync) return null;
       const meanV = sample.meanV ?? 128;
-      const gain = lumaGain(meanV);
+      const gain = Math.min(lumaGain(meanV), cfg.gainMax ?? 2);
       const norm = (sample.score ?? 0) * gain;
       const mc = sample.mc ?? 0;
       lastScore = norm;
@@ -112,6 +128,20 @@ export function createSelector(opts = {}) {
       const shiftCorr = Number.isFinite(sample.shiftCorr) ? sample.shiftCorr : 0;
       const scrollResid = Number.isFinite(sample.scrollResid) ? sample.scrollResid : 1;
       const pixFrac = Number.isFinite(sample.pixFrac30) ? sample.pixFrac30 : 0;
+      const bFrac15 = Number.isFinite(sample.bFrac15) ? sample.bFrac15 : null;
+      const hasB15 = bFrac15 !== null;
+      // 绝对分数窗口：最近 rawWindowMs 内的峰值（cut 额外要求绝对高分）
+      rawWin.push({ t, score: sample.score ?? 0, b15: hasB15 ? bFrac15 : 0 });
+      while (rawWin.length && t - rawWin[0].t > cfg.rawWindowMs) rawWin.shift();
+      let rawMaxScore = 0;
+      let rawMaxB15 = 0;
+      for (let i = 0; i < rawWin.length; i++) {
+        if (rawWin[i].score > rawMaxScore) rawMaxScore = rawWin[i].score;
+        if (rawWin[i].b15 > rawMaxB15) rawMaxB15 = rawWin[i].b15;
+      }
+      lastRawMaxScore = rawMaxScore;
+      lastRawMaxB15 = rawMaxB15;
+
       const structural = !hasStruct || bFrac30 >= cfg.cutBFrac || histDiff >= cfg.cutHist;
       // 滚动：位移可解释且补偿后残差低 → 不是切镜
       const scrollLike = hasStruct && shiftPx >= cfg.scrollShift && shiftCorr >= cfg.scrollCorr && scrollResid <= cfg.scrollResid;
@@ -130,7 +160,10 @@ export function createSelector(opts = {}) {
       const rateLimited = recent.length >= cfg.maxPerMinute;
       const sinceSelect = t - (lastSelectAt || startedAt);
 
-      const emit = (kind) => ({ kind, at: t, score: sample.score ?? 0, norm, z, mc, gain });
+      const emit = (kind) => {
+        lastKind = kind;
+        return { kind, at: t, score: sample.score ?? 0, norm, z, mc, gain };
+      };
 
       // 1) 文字变化：最高优先级，只受 textGapMs 约束
       if (textPending && t - lastTextAt >= 0 && (!lastSelectAt || t - lastSelectAt >= cfg.textGapMs)) {
@@ -140,17 +173,25 @@ export function createSelector(opts = {}) {
         return emit(TRIGGER.TEXT);
       }
 
-      // 2) 切镜：分数显著高于绝对阈值和自身基线，且是「版面/配色整体变化」而不是滚动/视频运动
-      if (norm >= threshold && z >= cfg.cutZ && mc >= cfg.cutMc && t - lastCutAt >= cfg.cutGapMs) {
+      // 2) 切镜：绝对窗口高分 + 最近 rawWindowMs 内版面级变化
+      // 有结构字段时不再要求 z：5s 基线在稀疏尖峰下不可靠（评测：median≈0、sigma 被尖峰抬高
+      // 反而会压掉真实切镜），绝对分数 + 结构特征已经是更强的证据。
+      const zOk = !hasStruct || z >= cfg.cutZ;
+      if (norm >= threshold && zOk && mc >= cfg.cutMc && t - lastCutAt >= cfg.cutGapMs) {
         const needBFrac = playback ? cfg.backoffCutBFrac : cfg.cutBFrac;
         const needHist = playback ? cfg.backoffCutHist : cfg.cutHist;
         const needMc = playback ? cfg.backoffCutMc : cfg.cutMc;
+        const needRawScore = playback ? cfg.backoffCutMinRawScore : cfg.cutMinRawScore;
+        const needRawB15 = playback ? cfg.backoffCutMinRawB15 : cfg.cutMinRawB15;
         const strongStructural = bFrac30 >= needBFrac && histDiff >= needHist;
-        const cutOk = !hasStruct || (structural && !scrollLike && mc >= needMc && (!playback || strongStructural));
+        const rawOk = rawMaxScore >= needRawScore && (!hasB15 || rawMaxB15 >= needRawB15);
+        const cutOk = rawOk && (!hasStruct || (structural && !scrollLike && mc >= needMc && (!playback || strongStructural)));
         if (cutOk) {
           if (rateLimited) return null;
           lastCutAt = t;
-          if (!lastSelectAt || t - lastSelectAt >= cfg.minSelectGapMs) {
+          // 保险帧（heartbeat）刚发过时允许 cut 立即接上：heartbeat 是「屏幕没变」的兜底，
+          // 换页发生在它之后 800ms 内时不应被选帧间隔挡住（代价是两张图相隔几百毫秒）。
+          if (!lastSelectAt || t - lastSelectAt >= cfg.minSelectGapMs || lastKind === TRIGGER.HEARTBEAT) {
             accept(t);
             return emit(TRIGGER.CUT);
           }
@@ -194,6 +235,8 @@ export function createSelector(opts = {}) {
         recentCount: recent.length,
         motionCount1s: motionAt.length,
         playback: motionAt.length >= cfg.backoffMotionCount,
+        rawMaxScore: lastRawMaxScore,
+        rawMaxB15: lastRawMaxB15,
       };
     },
 

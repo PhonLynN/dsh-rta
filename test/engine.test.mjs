@@ -319,3 +319,34 @@ test('composePages: 同一窗口内画面显著不同也拆成不同页面', asy
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('engine: 采样断档后的重同步帧不产生 cut，恢复后正常判定', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'rta-engine-'));
+  let phase = 0; // 0=底色 1=白屏（断档时）2=深色（恢复后的真实换页）
+  const source = fakeSource({
+    mutate(frame) {
+      if (!phase) return;
+      const [r, g, b] = phase === 1 ? [240, 240, 240] : [12, 18, 30];
+      for (let i = 0; i < frame.bgra.length; i += 4) {
+        frame.bgra[i] = r; frame.bgra[i + 1] = g; frame.bgra[i + 2] = b; frame.bgra[i + 3] = 255;
+      }
+    },
+  });
+  const engine = createEngine({ source, root, logger: null, autoTick: false, config: CONFIG });
+  const t0 = Date.now();
+  try {
+    await startEngine(engine, t0);
+    for (let i = 0; i < 20; i++) engine.tick(t0 + i * 125);
+    // 断档 3s：画面全变，但这一帧只是「重同步」，不该当切镜
+    phase = 1;
+    const resync = engine.tick(t0 + 20 * 125 + 3000);
+    assert.equal(resync?.decision, null, '重同步帧不应产生选帧决策');
+    // 正常间隔的下一帧：真实画面变化（白→深色）→ 应产生 cut
+    phase = 2;
+    const next = engine.tick(t0 + 20 * 125 + 3000 + 125);
+    assert.equal(next?.decision?.kind, 'cut', '恢复后的真实变化应判 cut');
+    await engine.stop({ reason: 'test' });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

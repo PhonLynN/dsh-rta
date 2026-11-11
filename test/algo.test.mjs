@@ -264,3 +264,46 @@ test('select: 视频播放退避——持续运动后提高 cut 门槛，真换�
   });
   assert.equal(strong?.kind, TRIGGER.CUT, '真换页在播放模式下也要被发现');
 });
+
+test('select: 采样断档后的重同步帧不产生 cut', () => {
+  const quiet = { mc: 0.02, meanV: 120, bFrac30: 0.01, histL1: 0.01, bFrac15: 0.01, pixFrac30: 0, shiftPx: 0, shiftCorr: 0, scrollResid: 1 };
+  const sel = createSelector({ window: 60 });
+  let t = 1000;
+  for (let i = 0; i < 40; i++, t += 66) sel.ingest({ t, score: 4, ...quiet });
+  // 断档 2s 后的重同步帧：内容变化很大，但不是真实切镜
+  const jump = sel.ingest({
+    t: t + 2000, score: 200, mc: 0.9, meanV: 120,
+    bFrac30: 0.9, histL1: 0.8, bFrac15: 0.9, pixFrac30: 0.9,
+    shiftPx: 0, shiftCorr: 0, scrollResid: 1, resync: true,
+  });
+  assert.equal(jump, null, '重同步帧应被忽略');
+  // 之后恢复正常判定：真实换页仍要能 cut
+  const page = sel.ingest({
+    t: t + 2066, score: 200, mc: 0.9, meanV: 120,
+    bFrac30: 0.9, histL1: 0.8, bFrac15: 0.9, pixFrac30: 0.9,
+    shiftPx: 0, shiftCorr: 0, scrollResid: 1,
+  });
+  assert.equal(page?.kind, TRIGGER.CUT);
+});
+
+test('select: 绝对分数窗口闸门——暗色界面低分变化不假 cut，真换页通过', () => {
+  const quiet = { mc: 0.02, meanV: 29, bFrac30: 0.01, histL1: 0.01, bFrac15: 0.01, pixFrac30: 0, shiftPx: 0, shiftCorr: 0, scrollResid: 1 };
+  const sel = createSelector({ window: 60 });
+  let t = 1000;
+  for (let i = 0; i < 40; i++, t += 66) sel.ingest({ t, score: 2, ...quiet });
+  // 暗色界面（meanV=29）gain 被抬到 2×：score 8 → norm 16 ≥ floor 15，软门也都能过；但绝对分 8 < 22
+  const weak = sel.ingest({
+    t, score: 8, mc: 0.25, meanV: 29,
+    bFrac30: 0.5, histL1: 0.25, bFrac15: 0.2, pixFrac30: 0.2,
+    shiftPx: 0, shiftCorr: 0, scrollResid: 1,
+  });
+  assert.ok(!weak || weak.kind !== TRIGGER.CUT, `低绝对分不该切镜，实际 ${weak?.kind}`);
+  // 真实换页：绝对分 60 + 强结构
+  t += 900;
+  const page = sel.ingest({
+    t, score: 60, mc: 0.7, meanV: 29,
+    bFrac30: 0.9, histL1: 0.5, bFrac15: 0.7, pixFrac30: 0.4,
+    shiftPx: 0, shiftCorr: 0, scrollResid: 1,
+  });
+  assert.equal(page?.kind, TRIGGER.CUT);
+});

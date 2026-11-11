@@ -167,6 +167,7 @@ export function createEngine(opts = {}) {
   };
   let lastDecision = null;
   let lastError = null;
+  let lastTickAt = 0;
 
   // 存档去重：屏幕没变时复用上一张 PNG 文件，时间轴仍然每个 tick 一行。
   // 静态桌面 15Hz 跑一小时不会写出 5 万张相同的图。
@@ -339,6 +340,11 @@ export function createEngine(opts = {}) {
     }
 
     // 1) 哨兵：采样降采样 → HSV → 分数 + 结构特征
+    // 采样断档（哨兵卡帧/系统休眠）：这一帧前后的时间缺口会让内容大幅跳变，但不是真实切镜，
+    // 只用于存档/更新基线，不参与选帧判定（避免「重同步」假 cut）。
+    const dtMs = lastTickAt ? now - lastTickAt : 0;
+    lastTickAt = now;
+    const resync = dtMs > 350;
     const sPixels = sentinelW * sentinelH;
     if (sentinelBuffersFlipped) {
       curRgb = rgbA; curHsv = hsvA; prevRgb = rgbB; prevHsv = hsvB;
@@ -366,6 +372,7 @@ export function createEngine(opts = {}) {
       t: now, score, mc, meanV,
       histL1: hist, bFrac30, bFrac15, pixFrac30: pixFrac,
       shiftPx: Math.abs(scroll.shift), shiftCorr: scroll.corr, scrollResid: scroll.residRatio,
+      resync,
     });
     if (decision) lastDecision = decision;
 
