@@ -29,6 +29,7 @@ function makeHarness({
   config = {},
   notesDir = null,
   autoNote = true,
+  startDelayMs = 0,
   onStartActivation = null,
 } = {}) {
   const starts = [];
@@ -62,6 +63,7 @@ function makeHarness({
     list: () => ['spawn', 'fork'],
     startActivation: async (spec) => {
       starts.push(spec);
+      if (startDelayMs) await sleep(startDelayMs);
       if (onStartActivation) onStartActivation(spec);
       writeNote();
       // 常驻 activation 的 result 只在被 drain 时 settle —— 用永不 settle 的 promise 模拟。
@@ -93,7 +95,7 @@ function makeHarness({
     ctx,
     engine,
     bound: { agent, sessionId: 'bound-session' },
-    boundSessionId: () => 'bound-session',
+    boundSessionId: () => agent.session.id,
     logger,
   };
   const summarizer = createSummarizer({
@@ -130,6 +132,7 @@ function makeHarness({
     advance: (ms) => { clock += ms; },
     clockNow: () => clock,
     setDigest: (text) => { digestText = text; },
+    setSession: (id) => { agent.session.id = id; },
     setEngineState: (state) => { engine.state = state; },
     dispose: () => {
       try { summarizer.dispose(); } catch { /* ignore */ }
@@ -178,6 +181,40 @@ test('summarizer: 首次触发创建一个 continuable child（delivery caller +
     assert.equal(st.starts, 1);
     assert.equal(st.prompts, 1);
     assert.equal(st.childAlive, true);
+  } finally {
+    h.dispose();
+  }
+});
+
+test('summarizer: 并发 tick（start + rebind 竞态）只创建一个 child、只投一轮', async () => {
+  const h = makeHarness({ startDelayMs: 30 });
+  try {
+    const [a, b] = await Promise.all([
+      h.summarizer.tickOnce({ reason: 'start', force: true }),
+      h.summarizer.tickOnce({ reason: 'start', force: true }),
+    ]);
+    assert.equal(h.starts.length, 1, '并发的 startActivation 必须合并成一个 child');
+    assert.notEqual(a, b, '只应有一个 tick 真正投递');
+    const st = h.summarizer.status();
+    assert.equal(st.starts, 1);
+    assert.equal(st.prompts, 1);
+    assert.equal(st.childAlive, true);
+  } finally {
+    h.dispose();
+  }
+});
+
+test('summarizer: stop 期间落地的 child 会被释作废（不留下孤儿）', async () => {
+  const h = makeHarness({ startDelayMs: 30 });
+  try {
+    const pending = h.summarizer.tickOnce({ reason: 'start', force: true });
+    while (h.starts.length === 0) await sleep(2); // 等它真的进到 startActivation 里
+    await h.summarizer.stop('test');
+    assert.equal(await pending, false, 'stop 后这一轮不应再投递');
+    await sleep(10);
+    assert.equal(h.starts.length, 1);
+    assert.equal(h.interrupts.length, 1, '创建后才落地的 child 应被 interrupt 释放');
+    assert.equal(h.drains.length, 1, '并 drain 掉');
   } finally {
     h.dispose();
   }
@@ -339,6 +376,47 @@ test('summarizer: 结算通知过滤器只吞本 child 的 notifySettlement，st
     // 还原后我们的 child 结算也能正常透传（避免 stop 后残留 patch）。
     h.manager.notifySettlement({ childId, announced: true }, 'done');
     assert.equal(h.settlements.length, 2);
+  } finally {
+    h.dispose();
+  }
+});
+
+test('summarizer: rebind 同一会话复用同一 child，并清掉 digest 去重再投一版', async () => {
+  const h = makeHarness();
+  try {
+    assert.equal(await h.summarizer.tickOnce({ reason: 'start', force: true }), true);
+    await settle(h);
+    assert.equal(h.starts.length, 1);
+    // digest 没变（屏幕静止），rebind 之后仍应该再要一版（新会话/重绑场景）。
+    const started = await h.summarizer.rebind(h.agent);
+    assert.equal(started, true);
+    assert.equal(h.starts.length, 1, '同一会话不能重建 child');
+    assert.equal(h.delivers.length, 1, '应通过 symbol 通道投递给同一个 child');
+    assert.equal(h.delivers[0].childId, h.starts[0].childId);
+    assert.equal(h.summarizer.status().prompts, 2);
+  } finally {
+    h.dispose();
+  }
+});
+
+test('summarizer: 新会话 rebind 时清掉旧 child（interrupt + drain），用新 parent 重建', async () => {
+  const h = makeHarness();
+  try {
+    assert.equal(await h.summarizer.tickOnce({ reason: 'start', force: true }), true);
+    await settle(h);
+    const oldChildId = h.starts[0].childId;
+    // 模拟用户在新会话里 rta_start：绑定 agent 换成了另一个会话。
+    h.setSession('new-session-a3038');
+    assert.equal(await h.summarizer.rebind(h.agent), true);
+
+    assert.equal(h.starts.length, 2, '新会话应重建一个 child');
+    assert.notEqual(h.starts[1].childId, oldChildId);
+    assert.equal(h.interrupts.length, 1);
+    assert.equal(h.interrupts[0].id, oldChildId);
+    assert.deepEqual(h.interrupts[0].authority, { kind: 'ancestor', agent: h.agent });
+    assert.deepEqual(h.drains[0].childIds, [oldChildId]);
+    assert.equal(h.summarizer.status().childSession, 'new-sess');
+    assert.equal(h.summarizer.status().settlementGuarded, true, '新 child 仍应被结算过滤器保护');
   } finally {
     h.dispose();
   }

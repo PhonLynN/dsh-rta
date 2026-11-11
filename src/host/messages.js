@@ -67,6 +67,28 @@ export function buildImageCaption({ frames = [], foreground = null, at = Date.no
 }
 
 /**
+ * 「多页经过」拼图说明（用户 m02213）：用户连续切换了多个窗口/页面时，一格一页，
+ * 让模型知道「经过的是哪几页」以及各自的标题，而不是只看到最后一帧。
+ *
+ * @param {object} input {pages, foreground, plan, at}
+ */
+export function buildPagesCaption({ pages = [], foreground = null, plan = null, at = Date.now() } = {}) {
+  const lines = ['〔RTA 多页截图 · 插件注入，非用户消息〕'];
+  if (foreground?.title) {
+    lines.push(`前台：${clampText(foreground.title)}${foreground.process ? ` [${clampText(foreground.process, 40)}]` : ''}`);
+  }
+  const when = pages.length ? clock(pages[pages.length - 1]?.wall ?? at) : clock(at);
+  const size = plan?.width && plan?.height ? ` · ${plan.width}×${plan.height}` : '';
+  lines.push(`时间：${when} · 最近经过的 ${Math.max(1, pages.length)} 个页面${size}`);
+  pages.slice(0, 12).forEach((page, i) => {
+    const title = clampText(page?.title ?? '（未知窗口）', 60);
+    lines.push(`${i + 1}. ${clock(page?.wall ?? at)} ${title}`);
+  });
+  lines.push('每格一页、按时间顺序排列；用户在这些页面之间切换过。要当前画面用 rta_look，更早历史用 rta_recall(images:true)。');
+  return lines.join('\n');
+}
+
+/**
  * 高清截图（从原生录像抽帧、裁窗、缩图）的说明文字。
  * 与 buildImageCaption 的区别：这里明确「这是原生分辨率、算法挑的一帧」，
  * 并告诉模型「想继续跟踪就 rta_note 记一句摘要」——注入过程本身就是摘要起点。

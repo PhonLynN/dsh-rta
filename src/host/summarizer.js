@@ -37,6 +37,11 @@ const DELIVER_PROMPT = Symbol.for('dsh.subagent.deliverPrompt');
 const EVENT_KINDS = new Set(['cut', 'region', 'text', 'manual']);
 const SETTLEMENT_GUARD_KEY = Symbol.for('dsh-rta.settlement-guard');
 
+/** agent → session id（宿主 agent 形状有两种：agent.session.id / agent.sessionId）。 */
+function sessionIdOf(agent) {
+  return agent?.session?.id ?? agent?.sessionId ?? null;
+}
+
 /**
  * 宿主缺口：continuable 子代理每轮结束后 activation 会 settle，下一次投递走
  * `coldResume()`，而 `coldResume` 调用 `materialize()` 时**没有透传 `delivery`**，
@@ -165,6 +170,10 @@ export function createSummarizer({ rt, logger = rt?.logger, config = {}, digest 
   let timer = null;
   let awaiting = null; // { at, baselineMtime, trigger, timer, watcher }
   let child = null; // { id, provider, controller, settled, startedAt, prompts }
+  let starting = null; // 正在 startActivation 的 promise（并发保护：一次只建一个 child）
+  let delivering = false; // 正在投递 prompt（并发保护：一次 tick 只投一轮）
+  const knownChildren = new Set(); // 本模块实例建过的所有 child（含竞态/孤儿），stop 时一并清
+  let startSeq = 0; // stop() 时自增，用来作废「stop 前发起、stop 后才落地」的创建
   let lastPromptAt = 0;
   let lastDigest = '';
   let lastSummary = '';
@@ -274,7 +283,8 @@ export function createSummarizer({ rt, logger = rt?.logger, config = {}, digest 
     if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; }
     clearAwaiting();
     const subagents = serviceOf(rt?.ctx, 'subagents');
-    const agent = rt?.bound?.agent ?? null;
+    // 用创建该 child 时的 parent agent（可能不是当前绑定会话的 agent，例如换绑后清旧的）。
+    const agent = child?.parentAgent ?? rt?.bound?.agent ?? null;
     const id = child?.id ?? null;
     if (id && subagents && agent) {
       try {
@@ -288,8 +298,21 @@ export function createSummarizer({ rt, logger = rt?.logger, config = {}, digest 
       logger?.info?.(`[rta] summary subagent cleared (${reason}, child=${String(id).slice(0, 8)})`);
     }
     if (child?.guard) releaseSettlementGuard(child.guard, id);
+    // 兜底：清掉本实例建过、但不在 child 记录里的子代理（并发竞态/重建遗留），
+    // 满足「结束 rta 后相关子代理都清掉」（用户 m01622）。
+    for (const k of [...knownChildren]) {
+      knownChildren.delete(k);
+      if (!subagents || !k.agent || k.id === id) continue;
+      try { subagents.interrupt(k.id, { kind: 'ancestor', agent: k.agent }); } catch { /* absent */ }
+      try { await subagents.drainChildren?.(k.agent, [k.id]); } catch { /* absent */ }
+    }
     child = null;
+    // 作废可能还在 startActivation 里的创建（stop 后才落地的 child 会被释放）。
+    startSeq += 1;
+    starting = null;
     lastPromptAt = 0;
+    // 下一段采集/新会话应该重新要一版摘要，而不是被上一段的 digest 去重挡住。
+    lastDigest = '';
     return true;
   }
 
@@ -298,34 +321,64 @@ export function createSummarizer({ rt, logger = rt?.logger, config = {}, digest 
     // 子代理一轮跑完后 activation 会 settle，但宿主保留 childId 可在下一次
     // deliverPrompt 时冷恢复，所以这里不能因为 settle 就重建（用户 m01622 要求复用同一个）。
     if (child) return child;
-    const childId = randomUUID();
-    const controller = new AbortController();
-    const activation = await subagents.startActivation({
-      provider,
-      childId, // 预留 childId → 本地 continuable 子代理（后续投递复用同一 child）
-      label: 'rta-screen-summary',
-      delivery: 'caller', // 结果不回父会话 → 主会话零唤醒
-      signal: controller.signal,
-      request: { prompt: [{ type: 'text', text: prompt }], parent: agent },
-    });
-    const id = activation?.childId ?? childId;
-    child = { id, provider, controller, settled: false, startedAt: now(), prompts: 0, guard: null };
-    // 首轮之后每次投递都会 cold-resume，宿主会丢 delivery:'caller'；装过滤器止唤。
-    const guard = acquireSettlementGuard(subagents);
-    if (guard) {
-      guard.children.add(id);
-      child.guard = guard;
+    // 并发保护：rta_start 的 start tick、onBind→rebind、45s interval tick 可能同时进来，
+    // 若都在 startActivation 的 await 里看到 child===null 就会各建一个 child（实测 20:15:02
+    // 一次启动建了两个子会话）。共享同一个 in-flight promise，只允许建一个。
+    if (starting) return starting;
+    const seq = startSeq;
+    starting = (async () => {
+      const childId = randomUUID();
+      const controller = new AbortController();
+      const activation = await subagents.startActivation({
+        provider,
+        childId, // 预留 childId → 本地 continuable 子代理（后续投递复用同一 child）
+        label: 'rta-screen-summary',
+        delivery: 'caller', // 结果不回父会话 → 主会话零唤醒
+        signal: controller.signal,
+        request: { prompt: [{ type: 'text', text: prompt }], parent: agent },
+      });
+      const id = activation?.childId ?? childId;
+      // stop() 在这期间跑过：这个刚落地的 child 已不属于任何 RTA 会话，直接释放。
+      if (seq !== startSeq) {
+        try { subagents.interrupt(id, { kind: 'ancestor', agent }); } catch { /* absent */ }
+        try { await subagents.drainChildren?.(agent, [id]); } catch { /* absent */ }
+        return null;
+      }
+      const created = {
+        id,
+        provider,
+        parentAgent: agent,
+        parentSession: sessionIdOf(agent),
+        controller,
+        settled: false,
+        startedAt: now(),
+        prompts: 0,
+        guard: null,
+      };
+      child = created;
+      // 首轮之后每次投递都会 cold-resume，宿主会丢 delivery:'caller'；装过滤器止唤。
+      const guard = acquireSettlementGuard(subagents);
+      if (guard) {
+        guard.children.add(id);
+        created.guard = guard;
+      }
+      starts += 1;
+      knownChildren.add({ id, agent });
+      logger?.info?.(`[rta] summary child created (provider=${provider}, child=${String(id).slice(0, 8)})`);
+      const result = activation?.result;
+      if (result && typeof result.then === 'function') {
+        result.then(
+          () => { if (child?.id === id) child.settled = true; },
+          (err) => { if (child?.id === id) child.settled = true; noteError('child', err); },
+        );
+      }
+      return created;
+    })();
+    try {
+      return await starting;
+    } finally {
+      starting = null;
     }
-    starts += 1;
-    logger?.info?.(`[rta] summary child created (provider=${provider}, child=${String(id).slice(0, 8)})`);
-    const result = activation?.result;
-    if (result && typeof result.then === 'function') {
-      result.then(
-        () => { if (child?.id === id) child.settled = true; },
-        (err) => { if (child?.id === id) child.settled = true; noteError('child', err); },
-      );
-    }
-    return child;
   }
 
   /**
@@ -333,8 +386,27 @@ export function createSummarizer({ rt, logger = rt?.logger, config = {}, digest 
    * `deliverSubagentPrompt(parent, childId, content, source, signal, 'queue')`。
    */
   async function deliverPrompt(subagents, agent, provider, prompt, trigger) {
+    // start tick / rebind / interval 可能并发进入；只允许一个在投递（否则会重复 prompt、覆盖 awaiting）。
+    if (delivering) {
+      lastSkip = 'busy-delivering';
+      return false;
+    }
+    delivering = true;
+    try {
+      return await deliverPromptOnce(subagents, agent, provider, prompt, trigger);
+    } finally {
+      delivering = false;
+    }
+  }
+
+  async function deliverPromptOnce(subagents, agent, provider, prompt, trigger) {
     const baseline = await readSummaryInfo().catch(() => ({ mtime: 0 }));
     const current = await ensureChild(subagents, agent, provider, prompt);
+    if (!current) {
+      // stop()/rebind 在创建期间发生：这个 child 已被作废，本轮直接放弃。
+      lastSkip = 'stopped-during-start';
+      return false;
+    }
     const firstPrompt = current.prompts === 0;
     if (!firstPrompt) {
       const deliver = subagents[DELIVER_PROMPT];
@@ -428,7 +500,14 @@ export function createSummarizer({ rt, logger = rt?.logger, config = {}, digest 
     lastDigest = text;
     promptWindow.push(at);
     try {
-      await deliverPrompt(subagents, agent, provider, prompt, reason);
+      const sent = await deliverPrompt(subagents, agent, provider, prompt, reason);
+      if (sent !== true) {
+        // 没投出去（stop 期间被作废 / 并发 tick 抢了投递）：把这一轮的预算与去重状态回滚。
+        lastPromptAt = 0;
+        lastDigest = '';
+        promptWindow.pop();
+        return false;
+      }
       return true;
     } catch (err) {
       noteError('start', err);
@@ -489,6 +568,34 @@ export function createSummarizer({ rt, logger = rt?.logger, config = {}, digest 
     return { ok: false, reason: awaiting ? 'timeout' : 'no-new-summary', summary: current ? clip(current, MAX_SUMMARY_CHARS) : '', summaryAt: lastSummaryAt || null };
   }
 
+  /**
+   * 会话重新绑定（用户 m02194）：新会话 rta_start 时，engine 可能早就在跑
+   * （engine.start 幂等、不再 emit 'start'），而第一次 tick 发生时绑定还没完成
+   * （rta_start 的 bind 在工具 settle 里）。旧 child 的 parent agent 属于上一个
+   * 会话，投递会 UNAUTHORIZED；必须清掉并在当前会话重建，否则新会话永远没有摘要。
+   */
+  async function rebind(agent) {
+    if (!cfg.enabled) return false;
+    if (!agent) return false;
+    const sid = sessionIdOf(agent);
+    if (!sid) return false;
+    if (child && child.parentSession && child.parentSession !== sid) {
+      await stop('rebind');
+    } else if (child && !child.parentSession) {
+      child.parentSession = sid;
+      child.parentAgent = agent;
+    }
+    // 新绑定：丢掉上一段会话的 digest 去重状态，强制先要一版。
+    lastDigest = '';
+    const started = await tickOnce({ reason: 'start', force: true });
+    if (!started && !awaiting) {
+      // 兜底：某些启动顺序下绑定/引擎状态要过一两百毫秒才完成。
+      const retry = setTimeout(() => { void tickOnce({ reason: 'start', force: true }); }, 1_500);
+      retry.unref?.();
+    }
+    return started;
+  }
+
   function schedule() {
     if (timer) return;
     timer = setInterval(() => { void tickOnce({ reason: 'interval' }); }, Math.max(2_000, Math.min(10_000, Math.floor(cfg.intervalMs / 3))));
@@ -530,6 +637,7 @@ export function createSummarizer({ rt, logger = rt?.logger, config = {}, digest 
       child: child ? String(child.id).slice(0, 8) : null,
       childAlive: Boolean(child),
       childSettled: Boolean(child?.settled),
+      childSession: child?.parentSession ? String(child.parentSession).slice(0, 8) : null,
       settlementGuarded: Boolean(child?.guard),
       awaiting: Boolean(awaiting),
       ticks,
@@ -547,6 +655,7 @@ export function createSummarizer({ rt, logger = rt?.logger, config = {}, digest 
     attach,
     dispose,
     stop,
+    rebind,
     tickOnce,
     onScreenEvent,
     requestNow,

@@ -20,7 +20,7 @@ import { createLiveBuffer } from './live-buffer.js';
 import { createInjector, createImageGovernor } from './injector.js';
 import { createScreenChannel } from './channel.js';
 import { createSummarizer } from './summarizer.js';
-import { buildScreenMessage, buildImageCaption, buildHdCaption } from './messages.js';
+import { buildScreenMessage, buildImageCaption, buildHdCaption, buildPagesCaption } from './messages.js';
 import { pickInformativeFrames, extractHdFrame, nativeFrameSize, makeHdDir, cleanHdDir } from './hd.js';
 import { attachRgb, attachPngFile } from './service.js';
 import { notifyDelivery } from './offload.js';
@@ -115,8 +115,13 @@ export function createLiveLifecycle({ rt, logger = rt?.logger } = {}) {
         injector.start({ sessionId });
         startNoticePending = true;
         logger?.info?.(`[rta] live buffer armed: ${sessionId ?? 'unknown'}`);
-        // 启动即要一版摘要（可能还没绑定会话，tickOnce 会跳过，下一轮 1Hz tick 重试）。
+        // 启动即要一版摘要（可能还没绑定会话，tickOnce 会跳过；绑定完成后 onBind 的
+        // rebind() 会补一次，这里再留一个 1.5s 兜底重试，覆盖「引擎先起、绑定后到」）。
         void summarizer.tickOnce({ reason: 'start', force: true }).catch(() => {});
+        const retry = setTimeout(() => {
+          void summarizer.tickOnce({ reason: 'start', force: true }).catch(() => {});
+        }, 1_500);
+        retry.unref?.();
       }));
       engineOffs.push(engine.on('push', (ev) => {
         if (disposed) return;
@@ -259,17 +264,44 @@ export function createLiveLifecycle({ rt, logger = rt?.logger } = {}) {
       let foreground = null;
       try { foreground = buffer.snapshot().foreground; } catch { foreground = null; }
 
-      const hd = await hdShot(engine, at, foreground);
-      let ref = hd?.ref ?? null;
-      let caption = hd?.caption ?? null;
+      let hd = null;
+      let ref = null;
+      let caption = null;
+      let mode = null;
+
+      // 1) 多页经过（用户 m02213）：一次连续切了几个窗口/页面时，覆盖优先于单帧可读性。
+      const montage = composeMontage(engine, at);
+      if (montage) {
+        ref = await attachRgb(rt?.ctx, {
+          rgb: montage.rgb,
+          width: montage.width,
+          height: montage.height,
+          name: `rta-pages-${montage.pages?.[0]?.seq ?? at}-${at}.png`,
+        });
+        if (ref) {
+          caption = buildPagesCaption({ pages: montage.pages, foreground, plan: montage.plan, at });
+          mode = 'pages';
+          logger?.info?.(`[rta] page montage injected (${montage.pages?.length ?? '?'} pages, ${montage.plan?.tokens ?? '?'} tok)`);
+        }
+      }
+
+      // 2) 单页 / 没有连续切页：一张可读的 HD 帧。
+      if (!ref) {
+        hd = await hdShot(engine, at, foreground);
+        ref = hd?.ref ?? null;
+        caption = hd?.caption ?? null;
+        if (ref) mode = 'hd';
+      }
 
       if (!ref && typeof engine.composeRecent === 'function') {
         // 回落：录像不可用（刚启动 / 无 ffmpeg / 抽帧失败）时用 eventRing 拼图。
-        const maxFrames = Number(imageConfig.maxFrames) > 0 ? Math.min(6, imageConfig.maxFrames) : 4;
-        const maxTokens = Number(imageConfig.maxSheetTokens) > 0 ? imageConfig.maxSheetTokens : 400;
-        const composed = engine.composeRecent({ count: maxFrames, maxTokens });
+        const maxFrames = Number(imageConfig.maxFrames) > 0 ? Math.min(12, imageConfig.maxFrames) : 8;
+        const maxTokens = Number(imageConfig.maxSheetTokens) > 0 ? imageConfig.maxSheetTokens : 700;
+        const composed = (typeof engine.composePages === 'function'
+          ? engine.composePages({ count: maxFrames, maxTokens, minPages: 2, now: at })
+          : null) ?? engine.composeRecent({ count: maxFrames, maxTokens });
         if (!composed?.rgb || !composed?.width || !composed?.height) return null;
-        const stamp = composed.frames?.[0]?.seq ?? at;
+        const stamp = composed.frames?.[0]?.seq ?? composed.pages?.[0]?.seq ?? at;
         ref = await attachRgb(rt?.ctx, {
           rgb: composed.rgb,
           width: composed.width,
@@ -280,7 +312,13 @@ export function createLiveLifecycle({ rt, logger = rt?.logger } = {}) {
           noteError('screenshot', 'attachRgb returned null (no attachments service?)');
           return null;
         }
-        caption = buildImageCaption({ frames: composed.frames ?? [], foreground, at });
+        if (composed.pages) {
+          caption = buildPagesCaption({ pages: composed.pages, foreground, plan: composed.plan, at });
+          mode = 'pages-fallback';
+        } else {
+          caption = buildImageCaption({ frames: composed.frames ?? [], foreground, at });
+          mode = 'sheet-fallback';
+        }
         logger?.info?.(`[rta] auto screenshot injected (${composed.plan?.count ?? composed.frames?.length ?? '?'} frames, sheet fallback)`);
       }
       if (!ref) return null;
@@ -296,9 +334,34 @@ export function createLiveLifecycle({ rt, logger = rt?.logger } = {}) {
         try { notifyDelivery(); } catch { /* ignore */ }
       }, 1000);
 
-      return { ref, caption, summary: hd ? 'RTA 高清截图（插件注入）' : 'RTA 自动截图（插件注入）' };
+      return {
+        ref,
+        caption,
+        summary: (mode === 'pages' || mode === 'pages-fallback')
+          ? 'RTA 多页截图（插件注入）'
+          : hd ? 'RTA 高清截图（插件注入）' : 'RTA 自动截图（插件注入）',
+      };
     } finally {
       if (!settled) governor.abort();
+    }
+  }
+
+  /**
+   * 「最近经过的多个页面」拼图（用户 m02213）：一次连续切了几个窗口/页面时，
+   * 单张 HD 帧只能看到最后一页；这里优先发一张跨越多页的宽拼图。
+   */
+  function composeMontage(engine, at) {
+    if (imageConfig.montage === false) return null;
+    if (typeof engine?.composePages !== 'function') return null;
+    const maxFrames = Number(imageConfig.montageFrames) > 0 ? Math.min(12, imageConfig.montageFrames) : 8;
+    const maxTokens = Number(imageConfig.montageMaxTokens) > 0 ? imageConfig.montageMaxTokens : 700;
+    const maxAgeMs = Number(imageConfig.montageMaxAgeMs) > 0 ? imageConfig.montageMaxAgeMs : 120_000;
+    const minPages = Number(imageConfig.montageMinPages) >= 3 ? Number(imageConfig.montageMinPages) : 3;
+    try {
+      return engine.composePages({ count: maxFrames, maxTokens, maxAgeMs, minPages, now: at });
+    } catch (err) {
+      noteError('montage', err);
+      return null;
     }
   }
 
@@ -363,6 +426,11 @@ export function createLiveLifecycle({ rt, logger = rt?.logger } = {}) {
         if (isBoundAgent(agent) && rt?.engine?.state === 'running') startNoticePending = true;
         // 新绑定：让下一轮 assemble 立刻带上屏幕状态（文本本身仍由 tick 计算）。
         if (isBoundAgent(agent)) injector.flush({ force: false });
+        // 新会话 rta_start：引擎可能早就在跑（不会 emit 'start'），这里是唯一能
+        // 确认「绑定已生效」的时机 → 让摘要子代理换到当前会话（用户 m02194）。
+        if (isBoundAgent(agent)) {
+          void summarizer.rebind?.(agent).catch((err) => noteError('summarizer-rebind', err));
+        }
       }) ?? null;
     } catch (err) {
       noteError('onBind', err);

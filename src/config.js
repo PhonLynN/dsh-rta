@@ -55,8 +55,13 @@ export const DEFAULT_RTA_CONFIG = Object.freeze({
       windowMs: 600_000,      // 预算窗口 10 分钟
       maxPerWindow: 6,        // 每 10 分钟最多 6 张
       maxInFlight: 1,         // 同时只允许一张在飞
-      maxFrames: 4,           // 拼图帧数
-      maxSheetTokens: 400,    // 单张拼图 token 预算
+      maxFrames: 8,           // 拼图帧数（回落路径；页面多时一屏能覆盖更多页）
+      maxSheetTokens: 700,    // 单张拼图 token 预算
+      montage: true,          // 连续切换多个页面时，优先发「多页经过」拼图（用户 m02213）
+      montageMinPages: 3,     // 页面数达到这个值才拼多页；1–2 页时保持单张可读 HD 帧
+      montageFrames: 8,       // 多页拼图最多几格（超过则取最近 8 页）
+      montageMaxTokens: 700,  // 多页拼图 token 预算
+      montageMaxAgeMs: 120_000, // 只统计最近 2 分钟内经过的页面（判「连续切换」而非「翻旧账」）
       hd: true,               // 优先从原生录像抽 HD 帧（裁窗+缩图），失败才回落拼图
       hdMaxWidth: 1600,       // HD 帧最大宽度（约 ≤900 tokens）
     },

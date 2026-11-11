@@ -2,12 +2,13 @@
 
 给 DSH 装一双实时的眼睛和一张嘴：**看见屏幕 → 本地算法筛选 → 只把有信息的画面交给会话模型 → 图片用完即省略、文字长期保留**。
 
-当前状态：**「启用即持续注入」+「高清帧通道」+「后台摘要子代理」已落地并真机实测生效**——`rta_start` 之后不需要模型主动调工具，
+当前状态：**「启用即持续注入」+「高清帧通道」+「多页经过拼图」+「后台摘要子代理」已落地并真机实测生效**——`rta_start` 之后不需要模型主动调工具，
 屏幕状态会以 runtime-context 快照的形式自动进入会话（前台窗口、活动强度、事件时间线），
-每轮首步还会附一张**裁窗后的高清帧**（从 2560×1440 原生录像抽帧，按预算缩放）和**后台子代理刚写的摘要**（主会话全程不被唤醒）。
-摘要子代理整个会话只用一个常驻 child，周期 / 密集事件 / `rta_summarize` 三种触发，`rta_stop` 时清除。
+每轮首步还会附一张**裁窗后的高清帧**（从 2560×1440 原生录像抽帧，按预算缩放）或**最近经过的多页拼图**，
+外加**后台子代理刚写的摘要**（主会话全程不被唤醒）。
+摘要子代理整个会话只用一个常驻 child（新会话绑定后自动起/自动换绑），周期 / 密集事件 / `rta_summarize` 三种触发，`rta_stop` 时清除。
 后端层（采集 / 打分 / 选择 / 拼图 / 录像 / 存储 / 工具）全跑通，
-73 个离线单测全过（10 算法 + 6 引擎 + 7 插件 + 19 注入面 + 14 高清帧 + 15 摘要子代理 + 2 存储）。
+78 个离线单测全过（10 算法 + 7 引擎 + 7 插件 + 19 注入面 + 14 高清帧 + 19 摘要子代理 + 2 存储）。
 UI/UX（悬浮窗、对话 / 轨迹面板、插件配置页）按计划放在下一阶段。
 
 平台：Windows 10/11（GDI + koffi 调 Win32）。插件侧只依赖 `@deepseek-ai/dsh-tools`（可选）。
@@ -47,7 +48,7 @@ RTA 的做法：**本地永远在采集，但只有通过筛选的画面才进�
 | 通道 | 用法 | 内容 | 节流 |
 | --- | --- | --- | --- |
 | 文字（主） | `systemPrompt.context({name:'rta:screen', order:205, interpolate:false, text})` | 上面那段文本；宿主**只在文本变化时**落一条 `runtime-context` 快照并声明旧快照被取代 | 文本相同不发布；`minIntervalMs=4000`；`maxPerMinute=8` |
-| 图片 + 摘要（稀缺） | `agent/pre-step` prepend 追加一条 `plugin:dsh-rta` 消息 | 每轮**首步**最多一张裁窗高清帧（按 token 预算反推宽度）＋后台子代理最新摘要（如有）；`rta_start` 当轮附「已启动」告知 | `minIntervalMs=45000`、10 分钟 ≤6 张、在飞 ≤1；摘要由子代理 `intervalMs=45000` 驱动 |
+| 图片 + 摘要（稀缺） | `agent/pre-step` prepend 追加一条 `plugin:dsh-rta` 消息 | 每轮**首步**最多一张裁窗高清帧（按 token 预算反推宽度）或**最近经过的多页拼图**（最近 2 分钟 ≥3 个页面时，见下节）＋后台子代理最新摘要（如有）；`rta_start` 当轮附「已启动」告知 | `minIntervalMs=45000`、10 分钟 ≤6 张、在飞 ≤1；摘要由子代理 `intervalMs=45000` 驱动 |
 
 设计约束（`docs/review/03-target-architecture.md`）：只追加尾部不改历史、自动流永不唤醒会话、
 单槽替换不排队、文字必带图片稀缺、幂等节流、全部硬封顶。子代理会话会被过滤（只服务绑定会话）。
@@ -66,11 +67,21 @@ RTA 的做法：**本地永远在采集，但只有通过筛选的画面才进�
 
 注入图片每轮最多一张（`minIntervalMs=45000`、10 分钟 ≤6、在飞 ≤1）；`rta_look` 默认 `count=2 / maxTokens=1200`（`hd:false` 可回退旧拼图）；`rta_recall(images:true)` 默认 `maxImages=3`，并默认隐藏 15fps 的逐帧索引行。
 
+## 多页经过拼图（pages）
+
+快速在多个页面/窗口之间切换时，单张 HD 帧只能留下最后停住的那一页，中间经过的页面会被漏掉。多页拼图专门补这个洞：
+
+- **页面归并**：事件入环形缓冲时带上窗口元信息（`win{title,process,rect}`）；`engine.composePages()` 把最近 `montageMaxAgeMs=120000` 内的事件按 `pageKey = process|title` 归并，连续停留在同一页只留最后一帧，因此「A→B→C→B」得到 A/B/C 三格而不是四格重复。
+- **触发**：`lifecycle.screenshotFor` 每轮首步先试多页拼图；只有窗口内页面数 ≥ `montageMinPages=3` 才发，否则退回单张裁窗 HD 帧（避免偶尔切一次页就把可读的大图换成小格子图）。
+- **出图**：最多 `montageFrames=8` 格、`montageMaxTokens=700`（八格 1260×756 ≈560 tokens），每格贴时间戳标签；caption 标题为「〔RTA 多页截图 · 插件注入，非用户消息〕」，并逐行列出「1. 14:32:10 标题」方便模型引用。
+- **回落**：无多页时依次走单帧 HD → 事件环形缓冲拼图（`composePages` → `composeRecent`），caption 与 `summary` 按 mode 标注，三种来源不会混。
+
 ## 后台摘要子代理
 
 主会话不能被打断，所以摘要不在主会话里做：
 
 - `rta_start` 后，RTA 用 `ctx.subagents.startActivation({provider, childId, delivery:'caller', request:{prompt, parent}})` 预留**整个 RTA 会话唯一的常驻 child**；之后每一轮都通过宿主 symbol 通道 `subagents[Symbol.for('dsh.subagent.deliverPrompt')](parent, childId, …)` 把新 prompt 投给同一个 child，不再新建子代理。`rta_stop` / dispose 时 `interrupt` + `drainChildren` 清除它（用户可在 `rta_status` 的 `summarizer.child` 看到它的 id）。
+- 新会话绑定（`onBind`）会自动 `rebind`：旧 child 先 `interrupt` + `drain`，再用新会话的 agent 起一个 child，并清空 digest/节流状态后立刻投一版；因此**新开会话后 `rta_start` 不会漏起摘要子代理**（此前的 bug 是 engine `start` 事件早于会话绑定、`tickOnce` 命中 `no-binding` 被跳过）。
 - 摘要触发有三种：① 周期（`intervalMs=45000`，10 分钟 ≤18 次，digest 不变时跳过）；② 密集事件（cut / 圈画 / 文字变化或强度 ≥18 的帧，2.5 s 防抖、12 s 最小间隔）；③ 主 agent 主动命令 `rta_summarize`（会等子代理写完新摘要再返回，绝不唤醒主会话）。
 - 子代理读 digest、必要时 `rta_look(count=1)`，然后 `rta_note({name:'screen-log', text})` 写 2–4 句中文摘要；prompt 会带上上一版摘要保持连续。主会话在每个新回合的 step 1 主动读 `notes/` 下最新的 `screen-log`，把「刚刚 / 约 N 分钟前」的摘要作为一条插件消息附上；`rta_start` 当轮还会附一条「已启动」告知。
 - 子代理只被放行只读工具（`rta_look` / `rta_region` / `rta_note`），不能 `rta_start` / `rta_stop`；主会话仍然是唯一绑定会话。
@@ -182,10 +193,15 @@ test/                  node --test，零依赖
       "windowMs": 600000,
       "maxPerWindow": 6,
       "maxInFlight": 1,
-      "maxFrames": 4,
-      "maxSheetTokens": 400,
+      "maxFrames": 8,
+      "maxSheetTokens": 700,
       "hd": true,
-      "hdMaxWidth": 1600
+      "hdMaxWidth": 1600,
+      "montage": true,
+      "montageMinPages": 3,
+      "montageFrames": 8,
+      "montageMaxTokens": 700,
+      "montageMaxAgeMs": 120000
     },
     "summarizer": {
       "enabled": true,
@@ -206,7 +222,7 @@ test/                  node --test，零依赖
 ## 开发 / 自测
 
 ```bash
-node --test test/*.test.mjs        # 73 个离线测试，不抓屏（宿主/沙箱里 spawn 受限时逐文件跑）
+node --test test/*.test.mjs        # 78 个离线测试，不抓屏（宿主/沙箱里 spawn 受限时逐文件跑）
 node test/live.test.mjs            # 只跑注入面（live-buffer / injector / channel / lifecycle）
 node test/hd.test.mjs              # 只跑高清帧通道（选帧 / 裁剪 / 缩图 / vf 生成）
 node test/summarizer.test.mjs      # 只跑后台摘要子代理（prompt / delivery / 节流 / 失败路径）
@@ -234,8 +250,9 @@ node bin/rta-sync.mjs              # 把 workspace 源码同步到已安装的�
 - OCR 读字（Windows.Media.Ocr，本地零下载）已做可行性验证，待接入自动管线；字幕 / ASR / 视频秒数识别 / 视觉笔记生成随后（设计已定：字幕轨 > ASR > 硬字幕 OCR；本地只做 OCR 读字，不跑本地小模型）。
 - 热键语义：`Ctrl+Alt` 只在**未启用时**召唤并启用（启用后屏幕状态本来就在自动注入，不需要再召唤）、`Shift+Ctrl+Alt` 圈画、`Ctrl+Tab` 退出本次 RTA、`Esc` 取消正在画的圈。退出后注入器会立刻把「已停止」状态写进上下文，模型不会继续以为在录。召唤通过 `ctx.agents` 推 notice 给当前会话（`src/host/summon.js`，source kind 用 `plugin:dsh-rta`），真实按键已实测通过。
 - 注入通道依赖宿主能力：有 `systemPrompt.context` 时走文本快照（主通道），有 `agent/pre-step` 时走每轮首步截图；两者都没有时自动降级为纯 pull（只保留 `rta_look`）。实测环境：dsh-desktop 0.2.2-rc.1 → `channel=context+pre-step`。
-- 摘要子代理整个 RTA 会话只保留一个常驻 child（`rta_status` 的 `summarizer.child` 可见，`rta_stop` 会 interrupt + drain 清除）。宿主 `coldResume` 不透传 `delivery:'caller'`，所以 RTA 在 `manager.notifySettlement` 上装了只针对本 child 的过滤器（`guard=on`）来维持零唤醒——这是宿主版本相关的私有兜底，宿主升级后若接口变化会自动降级为「会收到可见的结算通知」而不是崩溃。周期 45 s（10 分钟 ≤18 次）、密集事件 / `rta_summarize` 会更快触发；屏幕剧烈变化时摘要仍可能滞后 1–2 分钟。子代理 provider 默认 `spawn`，模型路由继承父会话（宿主 policy 不允许时启动失败，会记进 `rta_status` 的 summarizer.lastError）。
+- 摘要子代理整个 RTA 会话只保留一个常驻 child（`rta_status` 的 `summarizer.child` 可见，`rta_stop` 会 interrupt + drain 清除；新会话绑定会自动 rebind 到新 child，并发保护保证一次 `rta_start` 只会建一个）。宿主 `coldResume` 不透传 `delivery:'caller'`，所以 RTA 在 `manager.notifySettlement` 上装了只针对本 child 的过滤器（`guard=on`）来维持零唤醒——这是宿主版本相关的私有兜底，宿主升级后若接口变化会自动降级为「会收到可见的结算通知」而不是崩溃。周期 45 s（10 分钟 ≤18 次）、密集事件 / `rta_summarize` 会更快触发；屏幕剧烈变化时摘要仍可能滞后 1–2 分钟。子代理 provider 默认 `spawn`，模型路由继承父会话（宿主 policy 不允许时启动失败，会记进 `rta_status` 的 summarizer.lastError）。
 - 高清通道依赖录像轨与窗口 rect：`archiveMode:"jpeg"`、没有 ffmpeg、或事件太旧（帧已不在录像里）时自动退回 512px 拼图；全屏视频等「窗口 rect 不可靠」的场景会退化成整幅缩小（仍比 512px 拼图清晰）。
+- 多页经过拼图只在「最近 2 分钟经过 ≥3 个页面」时触发（`inject.image.montage*`）：页面缩到 315×177、标题只在 caption 里，看不清内容时仍应 `rta_look` / `rta_recall(images)` 取单页高清帧；`rta_look` 的 `count` 仍是 ≤6 张（多页拼图单格不计入该上限）。
 - 客户端 UI（悬浮窗、对话 / 轨迹 tab、插件配置页）未做，按计划后置。
 - 仅 Windows。
 

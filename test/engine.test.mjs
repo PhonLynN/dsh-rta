@@ -245,3 +245,37 @@ test('engine: 事件帧按原生分辨率落盘（可回看原图）', async () 
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('engine: composePages 按页面归并、每页只留最后一帧；不足 minPages 返回 null', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'rta-engine-'));
+  const source = fakeSource();
+  const engine = createEngine({ source, root, logger: null, autoTick: false, config: CONFIG });
+  const t0 = Date.now();
+  const mkRgb = (r, g, b) => {
+    const rgb = new Uint8Array(16 * 9 * 3);
+    for (let i = 0; i < rgb.length; i += 3) { rgb[i] = r; rgb[i + 1] = g; rgb[i + 2] = b; }
+    return rgb;
+  };
+  const ev = (seq, kind, wall, win, rgb) => ({ seq, kind, wall, rgb, width: 16, height: 9, win, score: 1 });
+  try {
+    await startEngine(engine, t0);
+    const ring = engine.eventRing;
+    ring.push(ev(1, 'cut', t0 + 1000, { process: 'msedge.exe', title: 'Page A' }, mkRgb(10, 20, 30)));
+    ring.push(ev(2, 'cut', t0 + 2000, { process: 'msedge.exe', title: 'Page A' }, mkRgb(40, 50, 60)));
+    ring.push(ev(3, 'heartbeat', t0 + 3000, { process: 'msedge.exe', title: 'Page B' }, mkRgb(70, 80, 90)));
+    ring.push(ev(4, 'cut', t0 + 4000, { process: 'msedge.exe', title: 'Page B' }, mkRgb(70, 80, 90)));
+    ring.push(ev(5, 'cut', t0 + 5000, { process: 'notepad.exe', title: 'Page C' }, mkRgb(100, 110, 120)));
+
+    const all = engine.composePages({ minPages: 2, now: t0 + 6000 });
+    assert.ok(all, '3 个页面应返回拼图');
+    assert.deepEqual(all.pages.map((p) => p.title), ['Page A', 'Page B', 'Page C']);
+    assert.equal(all.pages[0].seq, 2, '同页连续帧只留最后一帧');
+    assert.equal(all.rgb.length, all.width * all.height * 3);
+
+    const onlyRecent = engine.composePages({ minPages: 2, now: t0 + 6000, maxAgeMs: 1000 });
+    assert.equal(onlyRecent, null, '窗口内页面数不足时返回 null');
+    await engine.stop({ reason: 'test' });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -1,4 +1,4 @@
-﻿# 06 · 高清算法帧通道 + 后台摘要子代理：实现与真机验证报告
+# 06 · 高清算法帧通道 + 后台摘要子代理：实现与真机验证报告
 
 日期：2026-11-11（本地）
 对应需求：m00761（注入必须是算法判断后真正有信息的高清图像；注入过程中就开始总结）、m00826（主会话不能被打断，启用 RTA 时自动起子智能体持续生成摘要，主 agent 按需取高清原图）、m00963（每次启动 RTA 让主 agent 知晓；每次用户发消息时找子 agent 要刚刚产生的摘要）。
@@ -101,3 +101,40 @@
 - 兜底依赖宿主私有字段 `subagents.manager` 与 `manager.notifySettlement`，属版本相关实现；宿主升级后需回归 `rta_status` 的 `guard=on` 与主会话通知。
 - child 的每轮 activation 仍会 settle/冷启动（宿主语义），但不影响「同一个 child 会话」与零唤醒。
 - `rta_summarize` 等待上限 25 s；若子代理路由不可用（policy 不允许）会返回上一版摘要 + `lastError`。
+
+## 6. 多页经过拼图（pages）与并发修复
+
+### 6.1 问题
+
+用户 m02213：「我在某个软件连续切换了多个页面，但是 ai 没法知道我经过了这些页面，它获取也最多能拿 4 张，这太少了。」旧实现有两个结构性原因：
+
+1. 每轮首步只附 **1 张**裁窗 HD 帧，而 HD 帧来自「最后停住」的窗口 → 中间经过的页面全部丢失；回落拼图取的是「最近 N 帧」，同一页的近重复帧会挤掉别的页面。
+2. `eventRing` 只有 12 槽且事件不携带窗口元信息 → 即便回捞也无法恢复「经过了哪些页面」。
+
+### 6.2 实现
+
+- `engine/engine.js`：`maxEventsInMemory` 12 → 20；每个事件带 `win{title,process,rect}`；新增 `pageKeyOf(win)=process|title` 与 `composePages({count=8,maxTokens=700,maxAgeMs=120000,minPages=3})`——过滤 heartbeat/integral，按页面归并连续同页只留最后一帧，时间窗内不足 `minPages` 返回 null，否则 `planSheet`+`composeSheet` 出图并返回 `pages:[{seq,kind,wall,title,process}]`。
+- `host/messages.js`：`buildPagesCaption()` 生成标题「〔RTA 多页截图 · 插件注入，非用户消息〕」+ 前台 + 「最近经过的 N 个页面」+ 逐行 `1. hh:mm:ss 标题`。
+- `host/lifecycle.js`：`screenshotFor` 改为三层——① `composeMontage()`（读 `inject.image.montage*`）多页图（mode=`pages`）；② 单张 HD（`hdShot`）；③ `eventRing` 拼图回落（优先 `composePages`，其次 `composeRecent`）。caption/summary 按 mode 标注，三种来源不混。
+- `config.js`：`inject.image` 默认 `maxFrames: 4→8`、`maxSheetTokens: 400→700`，新增 `montage:true, montageMinPages:3, montageFrames:8, montageMaxTokens:700, montageMaxAgeMs:120000`。
+- 为什么不是「总要发多页图」：单格只有 315×177，文字不可读；只有最近 2 分钟经过 ≥3 个页面时才用多页图替换大单帧，否则保留可读的 HD 单帧（`montageMinPages` 从 2 收到 3 就是为此）。
+
+### 6.3 并发建 child bug（真机发现）
+
+- 现象：20:15:02 一次 `rta_start` 在 `C:\Users\PhonLynN\.dsh\sessions\--C-Users-PhonLynN-dsh_Workspace-dsh-RTA-dev--` 下建了**两个**子会话（`a01bfba1…`、`262b346e…`），`rta_status` `started=2`。
+- 根因：engine `start` tick、`onBind→rebind`、interval tick 并发进入 `ensureChild`，都在 `await startActivation` 窗口里看到 `child===null`，各建一个。
+- 修复（`host/summarizer.js`）：`starting` 单飞 promise；`startSeq` 在 `stop()` 自增，晚到的 child 立即 `interrupt`+`drain` 释放；`delivering` 防重复投递；`knownChildren` 集合让 `stop()` 兜底清理所有建过的 child；`tickOnce` 在未投出时回滚 `lastPromptAt/lastDigest/promptWindow`。
+- 测试：`summarizer.test.mjs` 19 条（新增「并发 tick 只建一个 child」「stop 期间落地的 child 被 interrupt+drain」）；全套 **78** 条全绿（10 算法 + 7 引擎 + 7 插件 + 19 注入面 + 14 高清帧 + 19 摘要子代理 + 2 存储）。
+
+### 6.4 真机证据（session=20261111-201804）
+
+1. `rta_status`：`summarizer: on … child=c2e99b39 guard=on prompts=1 trigger=start awaiting=1 started=1 errors=0` → 一次 `rta_start` 只建一个 child。
+2. 3 分钟内 sessions 目录只新增 `c2e99b39-c749-49d4-a321-06f68754d754`（20:18:05）；`notes/screen-log.md` 379B @20:18:12。
+3. 注入 `published=1`，bound 会话不变；此前 bug 遗留的 `a01bfba1…`（最后写 20:16:36）与 `262b346e…`（20:15:12）保持静止（不删用户会话数据；新代码不再产生孤儿）。
+4. `rta_stop` 后 child 清理、零结算通知的回归见 §5.3。
+
+### 6.5 已知边界
+
+- 多页图的格子小，读内容仍需 `rta_look` / `rta_recall(images)` 取单页高清帧；`rta_look` 的 `count ≤6` 仍不变。
+- 页面身份 = `process|title`：同一浏览器的不同 tab 若标题相同会被合并；`eventRing` 20 条，窗口内切页超过 20 次只保留最近的页面。
+- **文档编辑事故**：本次用 PowerShell `Get-Content -Raw | Set-Content -Encoding UTF8` 改 README/本文件导致 UTF-8 中文被 GBK 乱码化，已 `git checkout --` 还原并改用 edit 工具重写；后续中文文件只用 read/edit/write。

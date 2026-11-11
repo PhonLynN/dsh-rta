@@ -46,7 +46,7 @@ export const DEFAULT_ENGINE_CONFIG = Object.freeze({
   },
   selection: {},             // 透传给 algo/select.js
   retentionHours: 24,        // endedAt 之后图片保留 24h（文字永久）
-  maxEventsInMemory: 12,     // 推送事件 ring（含像素，~5MB）
+  maxEventsInMemory: 20,     // 推送事件 ring（含像素，~8MB；需要容纳一次连续切页的多个页面）
   maxArchiveInMemory: 24,    // 存档帧 ring（用于临时拼图回看）
   gcEveryMs: 3600_000,       // 每小时扫一次过期 session
 });
@@ -66,6 +66,15 @@ function fnv1a(bytes) {
 /** 窗口元信息也参与去重：同样的像素但换了窗口，仍然算新帧。 */
 function winKeyOf(win) {
   return win ? `${win.hwnd}|${win.title}|${win.rect?.x},${win.rect?.y},${win.rect?.w},${win.rect?.h}|${win.visible}` : '';
+}
+
+/**
+ * 「页面」身份：同一窗口里换 tab/路由时 hwnd 不变但标题会变；换应用时两者都变。
+ * 只看 process+title，忽略 rect（窗口拖动不算换页）。
+ */
+function pageKeyOf(win) {
+  if (!win) return '';
+  return `${win.process ?? ''}|${win.title ?? ''}`;
 }
 
 /** 创建引擎。参数都可以注入，方便单测/CLI。 */
@@ -388,6 +397,7 @@ export function createEngine(opts = {}) {
         id: rec.seq, kind: decision.kind, at: now, wall: now, seq: rec.seq,
         file: rec.file, rgb: frameRgb, width: archiveW, height: archiveH,
         regionIds: [],
+        win: winMeta(lastForeground),
       };
       eventRing.push(ev);
       while (eventRing.length > cfg.maxEventsInMemory) eventRing.shift();
@@ -539,6 +549,7 @@ export function createEngine(opts = {}) {
       regionIds: [region.id],
       region: { id: region.id, bbox: region.bbox, tStart: region.tStart, tEnd: region.tEnd },
       screen: { x, y, w, h },
+      win: winMeta(lastForeground),
     };
     eventRing.push(ev);
     while (eventRing.length > cfg.maxEventsInMemory) eventRing.shift();
@@ -591,6 +602,57 @@ export function createEngine(opts = {}) {
       frames: picks.map((e) => ({
         seq: e.seq, kind: e.kind, file: e.file, wall: e.wall, wallMs: e.wallMs,
         score: e.score, mc: e.mc, region: e.region,
+      })),
+    };
+  }
+
+  /**
+   * 把最近的事件按「页面」（process+窗口标题）归并成页面序列，每页取最后一次出现的帧。
+   * 用户 m02213：连续切换多个页面后，模型应该能看到**经过的每一页**，而不是同一页的
+   * 4 张近重复帧。返回 null 表示页面数不足（调用方退回单张 HD 帧）。
+   *
+   * @param {{count?: number, maxTokens?: number, maxAgeMs?: number, minPages?: number, now?: number}} [o]
+   */
+  function composePages({ count = 8, maxTokens = 700, maxAgeMs = 300_000, minPages = 2, now = Date.now() } = {}) {
+    const max = Math.max(1, Math.min(12, Number(count) || 8));
+    const floor = Math.max(2, Number(minPages) || 2);
+    const pool = eventRing.filter((ev) => ev && ev.kind && ev.kind !== 'heartbeat' && ev.kind !== 'integral');
+    const pages = [];
+    for (const ev of pool) {
+      const wall = Number(ev.wall ?? ev.at ?? 0);
+      if (!wall || now - wall > maxAgeMs) continue;
+      const key = pageKeyOf(ev.win);
+      const last = pages[pages.length - 1];
+      if (last && last.key === key) {
+        last.ev = ev;
+        last.wall = wall;
+        continue;
+      }
+      pages.push({ key, ev, wall });
+    }
+    if (pages.length < floor) return null;
+    const picks = pages.slice(-max);
+    const full = source?.size ?? { width: archiveW, height: archiveH };
+    const frames = picks.map((page) => ({
+      rgb: page.ev.rgb,
+      width: page.ev.width,
+      height: page.ev.height,
+      label: `T${page.ev.seq}`,
+      screen: { x: 0, y: 0, w: full.width, h: full.height },
+    }));
+    const plan = planSheet(frames.length, { maxTokens });
+    const sheet = composeSheet({ frames, plan, title: `RTA ${sessionId ?? ''}`.trim() });
+    return {
+      rgb: sheet.rgb,
+      width: sheet.width,
+      height: sheet.height,
+      plan,
+      pages: picks.map((page) => ({
+        seq: page.ev.seq,
+        kind: page.ev.kind,
+        wall: page.wall,
+        title: page.ev.win?.title ?? null,
+        process: page.ev.win?.process ?? null,
       })),
     };
   }
@@ -680,7 +742,7 @@ export function createEngine(opts = {}) {
     on: (event, fn) => bus.on(event, fn),
     off: (event, fn) => bus.off(event, fn),
     start, stop, tick, pollHotkeys, status,
-    pushNow, composeRecent, composeKind, saveSheet, recall, frameAt,
+    pushNow, composeRecent, composeKind, composePages, saveSheet, recall, frameAt,
     noteTextChange: (t) => selector?.noteTextChange(t),
     get cfg() { return cfg; },
     get state() { return state; },
