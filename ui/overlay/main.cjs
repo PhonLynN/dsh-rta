@@ -341,6 +341,7 @@ app.on('second-instance', () => {
   // 第二次启动 = 一次「热重载」信号：重新加载页面，拿到安装副本里最新的 client.js，
   // 这样调样式不需要停掉 RTA 会话再重新召唤。
   try {
+    log('second-instance: reloading overlay page');
     win?.webContents?.reloadIgnoringCache();
   } catch { /* ignore */ }
 });
@@ -361,11 +362,30 @@ app.whenReady().then(async () => {
     loadOverlayPage();
     startHitTest();
     startPolling();
+    watchRendererFiles();
   } catch (err) {
     log('createWindow failed', err && err.stack ? err.stack : String(err));
     app.quit();
   }
 });
+
+// 热重载兜底（比 second-instance 可靠）：安装副本里的 client.js 一变，就重载浮窗页面，
+// 这样改样式只要拷文件，不用停掉 RTA 会话再重新召唤。
+function watchRendererFiles() {
+  const clientFile = path.join(__dirname, '..', '..', 'src', 'client.js');
+  let reloadTimer = null;
+  try {
+    fs.watch(clientFile, { persistent: false }, () => {
+      if (reloadTimer) clearTimeout(reloadTimer);
+      reloadTimer = setTimeout(() => {
+        log('renderer file changed: reloading overlay page');
+        try { win?.webContents?.reloadIgnoringCache(); } catch { /* ignore */ }
+      }, 250);
+    });
+  } catch (err) {
+    log('watch renderer files failed', String(err));
+  }
+}
 
 app.on('window-all-closed', () => { log('window-all-closed'); app.quit(); });
 app.on('before-quit', () => {
