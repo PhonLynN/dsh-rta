@@ -1,14 +1,13 @@
 /**
  * ui/overlay/main.cjs — RTA 全局浮窗的 Electron 宿主。
  *
- * 路线（用户拍板，2026-11）：**透明置顶窗 + 渲染层采集背板 + 设计稿图层原样**。
+ * 路线（用户拍板，2026-11）：**透明置顶窗 + 设计稿图层原样 + 网点纹理**。
  *  - 窗口：透明置顶、不使用任何系统材质（不用 DWM Acrylic/Mica，不加 tint/系统圆角）；
- *  - 模糊：不做模糊、不做采集；卡片用纯色半透明底（rgba(20,20,22,0.55)）保证文字可读。
- *  - 设计稿图层：渐变/描边/squircle/阴影全部按 pen 导出原值，不做任何近似或补偿层。
+ *  - 模糊：不做模糊、不做采集；卡片用纯色半透明底（rgba(20,20,22,0.55)）+ 等距网点保证可读与质感。
+ *  - 设计稿图层：描边/squircle/阴影全部按 pen 导出原值，不做任何近似或补偿层。
  *  - 自反馈：默认不开内容保护（远程桌面本身也是抓屏，开了用户就看不到浮窗）；
  *    需要时可用 DSH_RTA_OVERLAY_CP=1 打开 setContentProtection 做本机调试。
- *  - 对齐：渲染层通过 preload 取窗口 bounds + 所在显示器 bounds/scaleFactor，
- *    把「卡片在窗口内的位置」换算成捕获流里的像素坐标。
+ *  - 热重载：再启动一次浮窗（拿不到单实例锁）会触发已有实例 reload，样式改动无需重启 RTA。
  *  - 一个窗口装两张卡（420×520 + 420×98 + 14 gap），四周 20px 给设计稿外阴影；
  *    卡外空白/缝隙点击穿透。
  */
@@ -337,7 +336,14 @@ function startPolling() {
   pollTimer = setInterval(() => { void tick(); }, POLL_MS);
 }
 
-app.on('second-instance', () => setVisible(true));
+app.on('second-instance', () => {
+  setVisible(true);
+  // 第二次启动 = 一次「热重载」信号：重新加载页面，拿到安装副本里最新的 client.js，
+  // 这样调样式不需要停掉 RTA 会话再重新召唤。
+  try {
+    win?.webContents?.reloadIgnoringCache();
+  } catch { /* ignore */ }
+});
 
 // 渲染层拿对齐信息（窗口位置 + 显示器 + 卡片矩形）。
 app.whenReady().then(async () => {
