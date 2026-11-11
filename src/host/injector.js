@@ -39,7 +39,7 @@ export function createInjector({ config = {}, buffer, logger, now = Date.now, on
     return {
       eventTtlMs: Number(config.eventTtlMs) > 0 ? config.eventTtlMs : 120_000,
       maxEvents: Number(config.maxEvents) > 0 ? config.maxEvents : 4,
-      maxLines: Number(config.maxLines) > 0 ? config.maxLines : 8,
+      maxLines: Number(config.maxLines) > 0 ? config.maxLines : 12,
       maxTextTokens: Number(config.maxTextTokens) > 0 ? config.maxTextTokens : 400,
     };
   }

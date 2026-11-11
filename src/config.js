@@ -45,7 +45,7 @@ export const DEFAULT_RTA_CONFIG = Object.freeze({
     minIntervalMs: 4000,      // 两条文本注入之间的最小间隔（防抖屏刷历史）
     maxPerMinute: 8,          // 每分钟最多落几条 runtime-context
     maxEvents: 4,             // 时间线最多列几条事件
-    maxLines: 8,              // digest 总行数上限
+    maxLines: 12,             // digest 总行数上限（标题/状态/计数/时间线/脚注一起算）
     maxTextTokens: 400,       // digest 目标 token 预算（按字符近似）
     eventTtlMs: 120_000,      // 时间线只覆盖最近 2 分钟
     staleMs: 15_000,          // 超过这么久没有采集心跳 → 文本里标注「数据不新鲜」

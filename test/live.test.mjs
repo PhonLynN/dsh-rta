@@ -138,6 +138,33 @@ test('live-buffer: 行数/字符双上限生效', () => {
   assert.match(text, /rta_look/);
 });
 
+test('live-buffer: 行数超限时保留「时间线」标题、只砍最早事件', () => {
+  const buf = createLiveBuffer();
+  buf.reset({ sessionId: 's1', at: 0, running: true });
+  for (let i = 0; i < 6; i += 1) {
+    buf.push({ kind: 'cut', seq: i + 1, at: 1_000 + i * 1_000, score: 30, win: { title: `窗口 ${i}`, process: 'p.exe' } }, 1_000 + i * 1_000);
+  }
+  const text = buf.digest(20_000, { eventTtlMs: 120_000, maxEvents: 6, maxLines: 8 });
+  const lines = text.split('\n');
+  assert.ok(lines.length <= 8, `lines <= 8 (${lines.length})`);
+  assert.match(text, /时间线（本地时间）：/);
+  const timeline = lines.filter((line) => line.startsWith('- '));
+  assert.ok(timeline.length >= 1);
+  // 砍掉的是最早的：最新一条（窗口 5）必须还在。
+  assert.match(timeline[timeline.length - 1], /窗口 5/);
+  assert.doesNotMatch(text, /窗口 0/);
+});
+
+test('live-buffer: 计数行只算事件窗口，不是整场累计', () => {
+  const buf = createLiveBuffer();
+  buf.reset({ sessionId: 's1', at: 0, running: true });
+  buf.push({ kind: 'cut', at: 5_000, score: 30, win: { title: 'A', process: 'a.exe' } }, 5_000);
+  buf.push({ kind: 'cut', at: 100_000, score: 30, win: { title: 'B', process: 'b.exe' } }, 100_000);
+  const text = buf.digest(130_000, { eventTtlMs: 120_000 });
+  assert.match(text, /明显变化 ×1/); // 5s 那条已过期，不累计
+  assert.equal(text.split('\n').filter((line) => line.startsWith('- ')).length, 1);
+});
+
 test('live-buffer: 采集延迟与静止时长用粗粒度文案（不会逐秒变化）', () => {
   const buf = createLiveBuffer();
   buf.reset({ sessionId: 's1', at: 0, running: true });

@@ -116,16 +116,17 @@ function sameWindow(a, b) {
 export function renderDigest(state, opts = {}) {
   const now = Number(state?.now) || Date.now();
   const eventTtlMs = Number(opts.eventTtlMs) > 0 ? Number(opts.eventTtlMs) : 120_000;
-  const maxLines = Number(opts.maxLines) > 0 ? Number(opts.maxLines) : 8;
+  const maxLines = Number(opts.maxLines) > 0 ? Number(opts.maxLines) : 12;
   const maxTextTokens = Number(opts.maxTextTokens) > 0 ? Number(opts.maxTextTokens) : 400;
   const maxChars = Math.max(120, Math.round(maxTextTokens * 1.5));
   const maxEvents = Number(opts.maxEvents) > 0 ? Number(opts.maxEvents) : 4;
 
   const events = Array.isArray(state?.events) ? state.events : [];
-  const visible = events
+  // 时间线与计数行用同一个窗口（最近 eventTtlMs），避免「最近 N 分钟」写成整场累计。
+  const windowEvents = events
     .filter((ev) => ev && ev.kind !== 'heartbeat' && ev.kind !== 'frame')
-    .filter((ev) => now - Number(ev.at ?? now) <= eventTtlMs)
-    .slice(-maxEvents);
+    .filter((ev) => now - Number(ev.at ?? now) <= eventTtlMs);
+  const visible = windowEvents.slice(-maxEvents);
 
   const lines = ['〔RTA 屏幕感知 · 自动注入，非用户消息〕'];
 
@@ -150,11 +151,10 @@ export function renderDigest(state, opts = {}) {
   else if (beatAge > 5_000) lines.push('状态：采集数据超过 5 秒没有更新');
   else lines.push(`状态：${ACTIVITY_TEXT[activityBucket(staticMs)] ?? ACTIVITY_TEXT.unknown}`);
 
-  // 计数行：窗口内各类事件各几次。
-  const counts = state?.counts ?? {};
+  // 计数行：窗口内各类事件各几次（与时间线同一窗口）。
   const parts = [];
   for (const kind of COUNTED_KINDS) {
-    const n = Number(counts[kind]) || 0;
+    const n = windowEvents.reduce((acc, ev) => acc + (ev.kind === kind ? 1 : 0), 0);
     if (n > 0) parts.push(`${KIND_TEXT[kind]} ×${n}`);
   }
   if (parts.length) {
@@ -176,19 +176,20 @@ export function renderDigest(state, opts = {}) {
 
   lines.push('需要原始画面：rta_look；更早历史：rta_recall。');
 
-  // 行数上限：先砍时间线最早的行（保留头部与尾巴）。
-  const head = 1; // 〔RTA ...〕
-  const foot = 1;
-  const timelineStart = head + 1 + 1 + (parts.length ? 1 : 0) + (visible.length ? 1 : 0);
-  while (lines.length > maxLines && lines.length > head + foot + 1 && lines.length > timelineStart + 1) {
-    lines.splice(head + 1 + 1 + (parts.length ? 1 : 0), 1); // 删第一条时间线（若有）
-    if (lines.length > maxLines) break;
+  // 行数上限：只砍时间线里最早的事件行，保留标题与尾巴；时间线至少留一条。
+  const timelineHeaderIdx = 1 + 1 + 1 + (parts.length ? 1 : 0); // 〔RTA〕+ 前台 + 状态（+ 计数）
+  const timelineStart = timelineHeaderIdx + (visible.length ? 1 : 0); // 第一条事件行
+  if (visible.length) {
+    while (lines.length > maxLines && lines.length > timelineStart + 1) {
+      lines.splice(timelineStart, 1);
+    }
   }
 
-  // 字符上限：从最旧的时间线开始丢，保证短而稳。
-  while (lines.join('\n').length > maxChars && lines.length > 4) {
+  // 字符上限：从最旧的事件行开始丢，至少保留最近一条（短而稳）。
+  while (lines.join('\n').length > maxChars) {
     const idx = lines.findIndex((line, i) => i >= 2 && line.startsWith('- '));
     if (idx < 0) break;
+    if (lines.filter((line) => line.startsWith('- ')).length <= 1) break;
     lines.splice(idx, 1);
   }
 
