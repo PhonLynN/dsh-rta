@@ -272,7 +272,7 @@ export function createRecorder({
    * 只做 input seek 在接近段尾时会失败（TS 时间戳/关键帧边界），只做 output seek
    * 又要从段首解到目标（300s 段太慢），所以两者组合。
    */
-  async function extractFrame(wallMs, outPath, { quality: jpegQuality = 2 } = {}) {
+  async function extractFrame(wallMs, outPath, { quality: jpegQuality = 2, vf = null } = {}) {
     const offsetSec = Math.max(0, (wallMs - state.startedAt) / 1000);
     const segIndex = Math.floor(offsetSec / segmentSeconds);
     const local = offsetSec - segIndex * segmentSeconds;
@@ -280,7 +280,8 @@ export function createRecorder({
     const seg = list[segIndex] ?? list[list.length - 1];
     if (!seg) return { ok: false, reason: 'segment-not-found', offsetSec, segIndex, files: list.length };
     const segPath = join(dir, seg);
-    const jpg = ['-frames:v', '1', '-q:v', String(jpegQuality), '-y', outPath];
+    const filter = typeof vf === 'string' && vf.trim() ? ['-vf', vf.trim()] : [];
+    const jpg = [...filter, '-frames:v', '1', '-q:v', String(jpegQuality), '-y', outPath];
     const hasOutput = () => existsSync(outPath) && statSync(outPath).size > 0;
 
     const pre = Math.max(0, local - 2);

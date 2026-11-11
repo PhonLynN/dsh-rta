@@ -62,10 +62,14 @@ export function startSpec() {
     name: TOOL_NAMES.start,
     description: 'Start RTA screen capture (the "eyes"). Once started, the screen state is injected into this '
       + 'conversation automatically (a short runtime-context snapshot whenever something noticeable changes, '
-      + 'plus at most one budgeted screenshot at the start of a turn) — you do NOT need to call rta_look to '
-      + 'know what the user is doing. Frames are stored locally and expire 24h after the session ends. '
-      + 'Idempotent: returns the current session if already recording. Binds RTA to the calling session — RTA '
-      + 'serves only one session at a time, and while recording a global always-on-top floating window shows its status.',
+      + 'plus at most one budgeted HD screenshot at the start of a turn) — you do NOT need to call rta_look to '
+      + 'know what the user is doing. A background summarizer subagent is also started while recording: it writes '
+      + 'a rolling 2-4 sentence summary of what is happening on screen (note name="screen-log"), and the newest '
+      + 'summary is attached at the start of each turn. The main conversation is never interrupted or woken by '
+      + 'this — summaries arrive passively with the next turn. Frames are stored locally and expire 24h after '
+      + 'the session ends. Idempotent: returns the current session if already recording. Binds RTA to the calling '
+      + 'session — RTA serves only one session at a time, and while recording a global always-on-top floating '
+      + 'window shows its status.',
     parameters: {},
     output: TEXT_OUTPUT,
     timeoutMs: 30_000,
@@ -93,7 +97,8 @@ export function statusSpec() {
     name: TOOL_NAMES.status,
     description: 'Read RTA status without sending any image: capture rate, session id/dir, frame counts, '
       + 'current foreground window, recent selected moments, automatic injection stats (channel, publish '
-      + 'count, injected screenshots), last error.',
+      + 'count, injected HD screenshots), background summarizer stats (provider, starts, errors, summary age), '
+      + 'last error.',
     parameters: {},
     output: TEXT_OUTPUT,
     timeoutMs: 10_000,
@@ -104,21 +109,26 @@ export function statusSpec() {
 export function lookSpec() {
   return {
     name: TOOL_NAMES.look,
-    description: 'See what is on the user\'s screen now: the most recently selected moments are packed '
-      + 'into one numbered image sheet, with a timestamped index. Starts capture if it is not running. '
-      + 'While RTA is running the screen state is already injected automatically — use this only when you '
-      + 'need a fresh close-up or more detail than the injected summary, not as a polling loop. Also useful '
-      + 'when the user says "look at this" or after a summon. Images are 200-600 tokens each; ask for 1-2 '
-      + 'frames unless the change matters over time. If RTA is currently bound to a different session this '
-      + 'returns a notice instead of stealing that capture.',
+    description: 'See what is on the user\'s screen now. By default this returns ONE cropped HD frame: the '
+      + 'frame is extracted from the native 2560x1440 recording, cropped to the foreground window / circled '
+      + 'area, and downscaled to the token budget — much sharper than the old 512x288 sheet, so on-screen text '
+      + 'is often readable. Pass hd:false (or count>1) for the older multi-frame sheet. Starts capture if it is '
+      + 'not running. While RTA is running the screen state and the background summary are already injected '
+      + 'automatically — use this only when you need a fresh close-up or the actual pixels, not as a polling '
+      + 'loop. Also useful when the user says "look at this" or after a summon. If RTA is currently bound to a '
+      + 'different session this returns a notice instead of stealing that capture.',
     parameters: {
       count: {
         type: 'integer',
-        description: 'How many recent frames to include, 1-6 (default 4).',
+        description: 'How many frames to include, 1-6 (default 2; the HD path keeps 1-2, the sheet path up to 6).',
       },
       maxTokens: {
         type: 'integer',
-        description: 'Token budget for the sheet; picks a smaller grid when needed (default 560).',
+        description: 'Token budget for the image(s); HD width and sheet grid are picked from it (default 1200).',
+      },
+      hd: {
+        type: 'boolean',
+        description: 'Use the HD cropped-frame path (default true). Set false for the legacy multi-frame sheet.',
       },
       note: {
         type: 'string',
@@ -152,19 +162,26 @@ export function recallSpec() {
     name: TOOL_NAMES.recall,
     description: 'Search RTA\'s local timeline by wall-clock time and get text records (frames, circled '
       + 'regions, notes) with timestamps. Use it to answer "what happened at 20:51" or to recover a '
-      + 'moment whose image you already read. Images on disk expire 24h after the session ends and are '
-      + 'then reported as expired; text is permanent.',
+      + 'moment whose image you already read. Per-frame archive rows are hidden by default (thousands of '
+      + 'rows would drown the events) — pass types="frame" if you really want them. With images:true it '
+      + 'picks up to maxImages informative moments spread across the window (not just the last three), '
+      + 'extracts each as a cropped HD frame from the native 2560x1440 recording and attaches them. Images '
+      + 'on disk expire 24h after the session ends and are then reported as expired; text is permanent.',
     parameters: {
       from: { type: 'string', description: 'Start of the window: ISO 8601 or epoch milliseconds. Default: session start.' },
       to: { type: 'string', description: 'End of the window: ISO 8601 or epoch milliseconds. Default: now.' },
       limit: { type: 'integer', description: 'Max records to return, 1-100 (default 40).' },
       types: {
         type: 'string',
-        description: 'Comma-separated kinds: frame,event,region,note,sheet (default all).',
+        description: 'Comma-separated kinds: frame,event,region,note,sheet (default all except per-frame archive rows).',
       },
       images: {
         type: 'boolean',
-        description: 'Also attach up to 3 frame images from the window (default false — costs tokens).',
+        description: 'Attach cropped HD frames for up to maxImages informative moments in the window (default false — costs tokens).',
+      },
+      maxImages: {
+        type: 'integer',
+        description: 'How many HD frames to attach when images:true, 1-4 (default 3).',
       },
     },
     output: IMAGE_OUTPUT,

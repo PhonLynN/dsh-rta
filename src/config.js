@@ -57,6 +57,17 @@ export const DEFAULT_RTA_CONFIG = Object.freeze({
       maxInFlight: 1,         // 同时只允许一张在飞
       maxFrames: 4,           // 拼图帧数
       maxSheetTokens: 400,    // 单张拼图 token 预算
+      hd: true,               // 优先从原生录像抽 HD 帧（裁窗+缩图），失败才回落拼图
+      hdMaxWidth: 1600,       // HD 帧最大宽度（约 ≤900 tokens）
+    },
+    // 后台摘要子代理：rta_start 后自动起，delivery:'caller'（不唤醒主会话），
+    // 把自己写的滚动摘要留在 rta_note(name='screen-log') 里，主会话每轮被动读取。
+    summarizer: {
+      enabled: true,
+      provider: null,         // null = 自动选（spawn → fork → 第一个已注册 provider）
+      intervalMs: 45_000,     // 两次启动之间的最短间隔
+      maxPer10Min: 6,         // 10 分钟最多启动几次
+      timeoutMs: 180_000,     // 单次子代理兜底超时
     },
   },
 });
@@ -73,6 +84,7 @@ export function readRtaConfig(env = process.env) {
     inject: {
       ...DEFAULT_RTA_CONFIG.inject,
       image: { ...DEFAULT_RTA_CONFIG.inject.image },
+      summarizer: { ...DEFAULT_RTA_CONFIG.inject.summarizer },
     },
   };
   let raw = null;
@@ -112,9 +124,20 @@ export function readRtaConfig(env = process.env) {
     if (image && typeof image === 'object') {
       if (typeof image.enabled === 'boolean') base.inject.image.enabled = image.enabled;
       for (const [key, value] of Object.entries(image)) {
-        if (key === 'enabled') continue;
+        if (key === 'enabled' || key === 'hd') { if (typeof value === 'boolean') base.inject.image[key] = value; continue; }
         const v = Number(value);
         if (Number.isFinite(v) && v >= 0) base.inject.image[key] = v;
+      }
+    }
+    const summarizer = raw.inject.summarizer;
+    if (summarizer && typeof summarizer === 'object') {
+      if (typeof summarizer.enabled === 'boolean') base.inject.summarizer.enabled = summarizer.enabled;
+      if (typeof summarizer.provider === 'string' && summarizer.provider.trim()) {
+        base.inject.summarizer.provider = summarizer.provider.trim();
+      }
+      for (const key of ['intervalMs', 'maxPer10Min', 'timeoutMs']) {
+        const v = Number(summarizer[key]);
+        if (Number.isFinite(v) && v >= 0) base.inject.summarizer[key] = v;
       }
     }
   }

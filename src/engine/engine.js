@@ -105,6 +105,9 @@ export function createEngine(opts = {}) {
   // 最近事件/存档（内存 ring，只用于"刚发生了什么"的拼图和回捞）
   const eventRing = [];
   const archiveRing = [];
+  // region 单独保活：视频播放时 cut/integral 会把 12 槽 eventRing 冲满，
+  // 用户圈过的区域不能因此丢（rta_region 的 P0 缺口）。
+  const regionRing = [];
 
   // 热键状态（8ms 轮询；不需要消息循环，见 win32.js 实测）
   const keys = { ctrl: false, alt: false, shift: false, esc: false, tab: false };
@@ -210,7 +213,7 @@ export function createEngine(opts = {}) {
     tickIndex = 0;
     lastTickStart = 0;
     stats.ticks = 0; stats.grabErrors = 0; stats.archived = 0; stats.events = 0; stats.dropped = 0;
-    eventRing.length = 0; archiveRing.length = 0;
+    eventRing.length = 0; archiveRing.length = 0; regionRing.length = 0;
     lastDecision = null; lastError = null;
     lastArchiveHash = 0; lastArchiveFile = null; lastArchiveWinKey = '';
     exitLatch = false;
@@ -539,6 +542,8 @@ export function createEngine(opts = {}) {
     };
     eventRing.push(ev);
     while (eventRing.length > cfg.maxEventsInMemory) eventRing.shift();
+    regionRing.push(ev);
+    while (regionRing.length > 24) regionRing.shift();
     selector.manual(Date.now());
     bus.emit('push', { ...ev, rgb: undefined, win: winMeta(lastForeground), decision: { kind: 'region' } });
     return ev;
@@ -567,7 +572,7 @@ export function createEngine(opts = {}) {
    * @param {{kind?: string|null, count?: number, maxTokens?: number, filter?: Function}} [o]
    */
   function composeKind({ kind = null, count = 4, maxTokens, filter = null } = {}) {
-    let pool = eventRing.length ? eventRing : archiveRing;
+    let pool = kind === 'region' && regionRing.length ? regionRing : (eventRing.length ? eventRing : archiveRing);
     if (kind) pool = pool.filter((e) => e.kind === kind);
     if (filter) pool = pool.filter(filter);
     const picks = pool.slice(-Math.max(1, Math.min(12, count)));
@@ -614,9 +619,9 @@ export function createEngine(opts = {}) {
   }
 
   /** 回看：把某个 wallMs 对应的原始帧从录像里抽出来（JPEG 文件）。 */
-  async function frameAt({ wallMs = Date.now(), outPath }) {
+  async function frameAt({ wallMs = Date.now(), outPath, vf = null }) {
     if (!recorder) return { ok: false, error: 'no-video-track' };
-    return recorder.extractFrame(wallMs, outPath);
+    return recorder.extractFrame(wallMs, outPath, vf ? { vf } : undefined);
   }
 
   function status() {
@@ -683,6 +688,7 @@ export function createEngine(opts = {}) {
     get store() { return store; },
     get source() { return source; },
     get eventRing() { return eventRing; },
+    get regionRing() { return regionRing; },
   };
 }
 

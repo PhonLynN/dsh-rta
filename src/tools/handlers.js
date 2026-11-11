@@ -9,6 +9,10 @@ import { readFile, mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { attachRgb, attachPngFile } from '../host/service.js';
+import {
+  KIND_LABEL, pickInformativeFrames, pickSpread, extractHdFrame, makeHdDir, cleanHdDir,
+  nativeFrameSize, widthForTokens,
+} from '../host/hd.js';
 import { notifyDelivery } from '../host/offload.js';
 import { SessionStore } from '../store/store.js';
 import { sessionsRoot } from '../store/paths.js';
@@ -105,7 +109,8 @@ export async function start(ctx, rt) {
         ? `floating window: on (${rt.overlay.endpoint ?? '?'}) — always on top, click-through card, drag by the header.`
         : 'floating window: unavailable (run `node scripts/install-overlay.mjs` to install the Electron runtime).',
       'RTA now serves this session only; other conversations get a notice until rta_stop (single-session binding).',
-      'continuous screen awareness: ON — from now on the screen state is injected into this conversation automatically (a short runtime-context snapshot whenever something changes), so you do not need to call rta_look to know what the user is doing. rta_look is only for a fresh close-up; screenshots are also attached at the start of a turn (at most one per turn, budgeted).',
+      'continuous screen awareness: ON — from now on the screen state is injected into this conversation automatically (a short runtime-context snapshot whenever something changes), so you do not need to call rta_look to know what the user is doing. rta_look is only for a fresh close-up; HD screenshots are also attached at the start of a turn (at most one per turn, budgeted).',
+      'background summarizer: ON — a subagent is spawned while recording and writes a rolling 2-4 sentence summary (note name="screen-log"); the newest summary is read and attached at the start of each turn. The main conversation is never interrupted or woken by it.',
       'turn it off with inject.enabled=false (text) or inject.image.enabled=false (screenshots) in the config, or fully with rta_stop. frames are stored locally and images expire 24h after the session ends.',
     ].join('\n');
     return { text };
@@ -153,6 +158,19 @@ export function status(ctx, rt) {
       const last = live.text?.lastPublishAt ? ` last=${iso(live.text.lastPublishAt)}` : '';
       return `injection: ${live.enabled ? 'on' : 'off'} channel=${live.channel} published=${live.text?.publishes ?? 0}${last} screenshots=${live.image?.injected ?? 0}${live.lastError ? ` lastError=${String(live.lastError).slice(0, 160)}` : ''}`;
     })(),
+    (() => {
+      let live = null;
+      try { live = rt.lifecycle?.status?.() ?? null; } catch { live = null; }
+      let sum = live?.summarizer ?? null;
+      if (!sum) {
+        try { sum = rt.summarizer?.status?.() ?? null; } catch { sum = null; }
+      }
+      if (!sum) return null;
+      const age = Number.isFinite(sum.summaryAgeMs) && sum.summaryAgeMs >= 0
+        ? `${Math.round(sum.summaryAgeMs / 1000)}s ago`
+        : 'none yet';
+      return `summarizer: ${sum.enabled ? 'on' : 'off'} provider=${sum.provider ?? 'auto'} attached=${sum.attached ? 'yes' : 'no'} subagents=${sum.subagents ? 'yes' : 'no'} engine=${sum.running ? 'running' : 'idle'} ticks=${sum.ticks ?? 0}${sum.lastSkip ? ` skip=${sum.lastSkip}` : ''} started=${sum.starts ?? 0} errors=${sum.errors ?? 0}${sum.inFlight ? ' inFlight=1' : ''} summary=${sum.summaryChars ? `${sum.summaryChars}ch (${age})` : 'none yet'}${sum.lastError ? ` lastError=${String(sum.lastError).slice(0, 160)}` : ''}`;
+    })(),
     rt.overlay
       ? `floating window: ${rt.overlay.running ? 'on' : 'off'} endpoint=${rt.overlay.endpoint ?? 'n/a'}`
       : 'floating window: not started',
@@ -165,9 +183,61 @@ export function status(ctx, rt) {
   return { text: clip(lines.join('\n')) };
 }
 
+function kindLabel(ev) {
+  return KIND_LABEL[ev?.kind] ?? String(ev?.kind ?? '画面');
+}
+
+/**
+ * 按「信息量」从原生录像抽 HD 帧：取最近事件里最值得看的 count 条，
+ * 各自裁到当时的窗口/圈选区域，按 token 预算缩图。
+ * 失败（录像没就绪/无 ffmpeg）返回空数组，调用方回落 512 拼图。
+ */
+async function hdFrames(ctx, rt, engine, { count, maxTokens, note = null }) {
+  const events = Array.isArray(engine.eventRing) ? engine.eventRing.slice(-128) : [];
+  const picked = pickInformativeFrames(events, { limit: count, now: Date.now(), maxAgeMs: 180_000 });
+  if (!picked.length) return { images: [], lines: [] };
+
+  let foreground = null;
+  try { foreground = engine.status?.()?.foreground ?? null; } catch { foreground = null; }
+  const size = nativeFrameSize(engine);
+  const perImage = Math.max(200, Math.floor(maxTokens / picked.length));
+  const maxWidth = widthForTokens(perImage);
+  const dir = await makeHdDir();
+  const images = [];
+  const lines = [];
+  try {
+    for (const row of picked) {
+      const shot = await extractHdFrame(engine, row.ev, {
+        dir, foreground, frameWidth: size.width, frameHeight: size.height, maxWidth,
+      });
+      if (!shot.ok) continue;
+      const attachment = await attachPngFile(ctx, {
+        file: shot.path,
+        name: `rta-look-hd-${row.ev?.seq ?? Math.round(row.wall)}-${Date.now()}.jpg`,
+      });
+      if (!attachment) continue;
+      images.push(attachment);
+      notifyDelivery();
+      lines.push(`${iso(row.wall)}  ${kindLabel(row.ev)}${row.ev?.score ? ` 强度 ${Math.round(row.ev.score)}` : ''}  ${shot.width}×${shot.height} ~${shot.tokens} tok`);
+    }
+  } finally {
+    void cleanHdDir(dir);
+  }
+  if (!images.length) return { images: [], lines: [] };
+
+  const text = [
+    `RTA ${engine.sessionId} — ${images.length} HD frame(s) picked by importance (region > cut > integral), cropped to the window at that moment.`,
+    ...(note ? [`note: ${note}`] : []),
+    ...lines,
+    'originals stay in the 2560×1440 recording; more frames: rta_recall(images:true), earlier history: rta_recall.',
+  ].join('\n');
+  return { images, text: clip(text) };
+}
+
 export async function look(ctx, rt, args = {}) {
-  const count = clampInt(args.count, 1, 6, 4);
-  const maxTokens = args.maxTokens ? clampInt(args.maxTokens, 200, 1600, rt.config.maxSheetTokens) : rt.config.maxSheetTokens;
+  const count = clampInt(args.count, 1, 4, 2);
+  const maxTokens = args.maxTokens ? clampInt(args.maxTokens, 200, 2400, 1200) : 1200;
+  const note = args.note ? String(args.note).slice(0, 400) : null;
 
   let engine;
   try {
@@ -176,7 +246,13 @@ export async function look(ctx, rt, args = {}) {
     return { images: [], text: `RTA could not start capture: ${err?.message ?? err}` };
   }
 
-  const recent = engine.composeRecent({ count, maxTokens });
+  if (args.hd !== false) {
+    const hd = await hdFrames(ctx, rt, engine, { count, maxTokens, note });
+    if (hd.images.length) return hd;
+  }
+
+  // 回落：eventRing 拼图（旧行为，保留给录像不可用的情况）。
+  const recent = engine.composeRecent({ count, maxTokens: Math.min(maxTokens, rt.config.maxSheetTokens) });
   if (!recent.frames.length) {
     return {
       images: [],
@@ -191,7 +267,7 @@ export async function look(ctx, rt, args = {}) {
   } catch (err) {
     rt.logger.warn(`[rta] look attach failed: ${err?.message ?? err}`);
   }
-  const text = sheetText(engine, recent, args.note ? String(args.note).slice(0, 400) : null);
+  const text = sheetText(engine, recent, note);
   if (!attachment) {
     return { images: [], text: `${text}\n\n(host has no attachments service: the sheet image could not be shown)` };
   }
@@ -241,13 +317,15 @@ async function readIndexFile(dir) {
 }
 
 export async function recall(ctx, rt, args = {}) {
-  const limit = clampInt(args.limit, 1, 100, 40);
+  const limit = clampInt(args.limit, 1, 200, 40);
   const types = typeof args.types === 'string' && args.types.trim()
     ? args.types.split(',').map((s) => s.trim()).filter(Boolean)
     : null;
   const now = Date.now();
   const from = parseTime(args.from, 0);
   const to = parseTime(args.to, now);
+  const wantImages = args.images === true;
+  const maxImages = clampInt(args.maxImages, 1, 4, 3);
 
   let records = [];
   let scope = null;
@@ -269,50 +347,64 @@ export async function recall(ctx, rt, args = {}) {
     });
   }
 
-  const picked = records.slice(-limit);
+  // 默认把 15fps 的逐帧行藏起来：它们是录像索引，不是「发生过什么」。事件优先。
+  const frameRows = types ? 0 : records.filter((r) => r.type === 'frame').length;
+  const visible = types ? records : records.filter((r) => r.type !== 'frame');
+  const picked = visible.slice(-limit);
+
   const images = [];
   const expired = [];
-  if (args.images === true) {
-    const withFiles = picked.filter((r) => r.file && ['frame', 'event', 'region', 'sheet'].includes(r.type)).slice(-3);
-    for (const r of withFiles) {
-      try {
-        const attachment = await attachPngFile(ctx, { file: r.file });
-        if (attachment) { images.push(attachment); notifyDelivery(); }
-      } catch {
-        expired.push(r.file);
-      }
-    }
-    // 录像轨：索引行没有图片文件，按 videoMs 从视频里抽原始帧（JPEG）
-    const videoRows = picked
-      .filter((r) => r.type === 'frame' && !r.file && r.videoMs != null)
-      .slice(-3);
-    if (videoRows.length && typeof engine?.frameAt === 'function') {
-      const dir = await mkdtemp(join(tmpdir(), 'rta-recall-'));
-      for (const r of videoRows) {
-        const out = join(dir, `video-${r.seq ?? Math.round(r.videoMs)}.jpg`);
-        try {
-          const res = await engine.frameAt({ wallMs: r.wallMs ?? r.wall, outPath: out });
-          if (res?.ok) {
-            const attachment = await attachPngFile(ctx, { file: out });
-            if (attachment) { images.push(attachment); notifyDelivery(); }
-          } else {
-            expired.push(`video@${(Number(r.videoMs) / 1000).toFixed(1)}s`);
+  const shotLines = [];
+  if (wantImages) {
+    const dir = await makeHdDir();
+    try {
+      const windowFrom = from || (records[0]?.wall ?? now - 60_000);
+      const picks = pickSpread(records, { limit: maxImages, from: windowFrom, to });
+      const perImage = Math.max(240, Math.floor(2400 / maxImages));
+      for (const row of picks) {
+        const rec = row.record;
+        let attachment = null;
+        let label = row.fromFrame ? 'video frame' : kindLabel(rec);
+        // 首选：从原生录像抽帧 + 裁窗 + 缩图（引擎在跑、该时刻有录像时）。
+        if (engine && typeof engine.frameAt === 'function') {
+          const shot = await extractHdFrame(engine, rec, {
+            dir,
+            foreground: null,
+            maxWidth: widthForTokens(perImage),
+          });
+          if (shot.ok) {
+            attachment = await attachPngFile(ctx, {
+              file: shot.path,
+              name: `rta-recall-hd-${rec.seq ?? Math.round(row.wall)}.jpg`,
+            });
+            if (attachment) label += ` ${shot.width}×${shot.height}`;
           }
-        } catch {
-          expired.push(`video@${(Number(r.videoMs) / 1000).toFixed(1)}s`);
+        }
+        if (!attachment && rec.file) {
+          try { attachment = await attachPngFile(ctx, { file: rec.file }); } catch { /* ignore */ }
+        }
+        if (attachment) {
+          images.push(attachment);
+          notifyDelivery();
+          shotLines.push(`${iso(row.wall)}  ${label}${row.fromFrame ? '  (evenly sampled)' : `  weight=${Math.round(row.weight)}`}`);
+        } else {
+          expired.push(`${rec.seq ?? '?'}@${iso(row.wall)}`);
         }
       }
+    } finally {
+      void cleanHdDir(dir);
     }
   }
 
   const lines = [
-    `RTA recall ${iso(from)} → ${iso(to)} — ${picked.length}/${records.length} record(s) from ${scope.sessionId}`,
+    `RTA recall ${iso(from)} → ${iso(to)} — ${picked.length}/${records.length} record(s) from ${scope.sessionId}${frameRows ? ` (${frameRows} raw frame rows hidden; pass types:"frame" to see them)` : ''}`,
     `dir=${scope.dir}`,
   ];
   if (!picked.length) lines.push('(no records in this window)');
   for (const r of picked) lines.push(recordLine(r));
-  if (expired.length) lines.push(`images expired or unreadable: ${expired.map((f) => f.split(/[\\/]/).pop()).join(', ')}`);
-  if (images.length) lines.push(`attached ${images.length} frame image(s).`);
+  if (wantImages && shotLines.length) lines.push('', 'HD frames (algorithm-picked, native resolution, cropped to window):', ...shotLines);
+  if (expired.length) lines.push(`images unreadable: ${expired.slice(0, 6).join(', ')}`);
+  if (images.length) lines.push(`attached ${images.length} image(s).`);
   return { images, text: clip(lines.join('\n')) };
 }
 

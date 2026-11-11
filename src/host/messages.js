@@ -13,6 +13,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { KIND_LABEL } from './hd.js';
 
 export const SOURCE_KIND = 'plugin:dsh-rta';
 
@@ -62,5 +63,28 @@ export function buildImageCaption({ frames = [], foreground = null, at = Date.no
   const when = frames.length ? clock(frames[frames.length - 1]?.wall ?? at) : clock(at);
   lines.push(`时间：${when} · ${Math.max(1, frames.length)} 帧拼图${labels.length ? `（${labels.slice(-4).join(' / ')}）` : ''}`);
   lines.push('这是本轮回答开始时用户屏幕的画面；需要更新用 rta_look，要精确区域用 rta_region。');
+  return lines.join('\n');
+}
+
+/**
+ * 高清截图（从原生录像抽帧、裁窗、缩图）的说明文字。
+ * 与 buildImageCaption 的区别：这里明确「这是原生分辨率、算法挑的一帧」，
+ * 并告诉模型「想继续跟踪就 rta_note 记一句摘要」——注入过程本身就是摘要起点。
+ *
+ * @param {object} input {event, foreground, hd, at}
+ */
+export function buildHdCaption({ event = null, foreground = null, hd = null, at = Date.now() } = {}) {
+  const lines = ['〔RTA 高清截图 · 插件注入，非用户消息〕'];
+  const title = foreground?.title ?? event?.win?.title ?? event?.window?.title ?? null;
+  const process = foreground?.process ?? event?.win?.process ?? null;
+  if (title) lines.push(`前台：${clampText(title)}${process ? ` [${clampText(process, 40)}]` : ''}`);
+  const when = clock(event?.wall ?? event?.at ?? at);
+  const kind = KIND_LABEL[event?.kind] ?? '画面';
+  const score = Number(event?.score) > 0 ? `（强度 ${Math.round(Number(event.score))}）` : '';
+  const size = hd?.width && hd?.height ? ` · ${hd.width}×${hd.height}` : '';
+  const crop = hd?.rect ? '（已裁到当时的窗口/圈选区域）' : '';
+  lines.push(`时间：${when} · ${kind}${score}${size}${crop}`);
+  lines.push('这是本轮开始前信息量最大的一帧；需要更新的画面用 rta_look，更早历史用 rta_recall(images:true)。');
+  lines.push('如果这段活动值得跟踪，用 rta_note 记 1–2 句摘要（name=screen-log），后续注入会带上它。');
   return lines.join('\n');
 }

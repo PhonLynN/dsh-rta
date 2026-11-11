@@ -120,14 +120,28 @@ export function createRuntime({ ctx, env = process.env } = {}) {
     return bound?.sessionId ?? null;
   }
 
+  /** 只读的实时面工具：绑定会话的子代理（后台摘要器）也可以用。 */
+  const CHILD_READ_TOOLS = new Set(['rta_look', 'rta_region', 'rta_note']);
+
+  function headerOf(agent) {
+    try {
+      return agent?.session?.header ?? agent?.header ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * 实时面工具的单会话闸门：已绑定且调用方是另一个会话 → 拒绝并说明怎么切。
    * 没绑定（还没 rta_start）时放行，由 rta_start 自己完成绑定。
+   * 例外：绑定会话的直接子代理（后台摘要器）可以读画面/写笔记，但不能再 start/stop。
    */
   function gateTool(toolName, agent) {
     if (!LIVE_TOOLS.has(toolName) || !bound) return { ok: true };
     const caller = sessionIdOf(agent);
     if (!caller || caller === bound.sessionId) return { ok: true };
+    const parent = headerOf(agent)?.parentSession ?? null;
+    if (CHILD_READ_TOOLS.has(toolName) && parent === bound.sessionId) return { ok: true };
     return {
       ok: false,
       text: `RTA 正在服务另一个会话（${shortSession(bound.sessionId)}）。同一时间 RTA 只作用于单一会话：`
@@ -301,7 +315,7 @@ export function createRuntime({ ctx, env = process.env } = {}) {
     bindAgent,
     releaseBinding,
     boundSessionId,
-    get bound() { return bound ? { sessionId: bound.sessionId } : null; },
+    get bound() { return bound ? { sessionId: bound.sessionId, agent: bound.agent } : null; },
     /** 实时面工具的单会话闸门（见 gateTool）。 */
     gateTool,
     /** 全局浮窗宿主（Electron）。 */
