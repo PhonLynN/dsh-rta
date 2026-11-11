@@ -388,7 +388,8 @@ export function createEngine(opts = {}) {
       };
       eventRing.push(ev);
       while (eventRing.length > cfg.maxEventsInMemory) eventRing.shift();
-      bus.emit('push', { ...ev, rgb: undefined, decision });
+      // win：让订阅方（host/live-buffer）不用再猜「这条变化发生在哪个窗口」。
+      bus.emit('push', { ...ev, rgb: undefined, win: winMeta(lastForeground), decision });
     }
 
     tickIndex++;
@@ -539,7 +540,7 @@ export function createEngine(opts = {}) {
     eventRing.push(ev);
     while (eventRing.length > cfg.maxEventsInMemory) eventRing.shift();
     selector.manual(Date.now());
-    bus.emit('push', { ...ev, rgb: undefined, decision: { kind: 'region' } });
+    bus.emit('push', { ...ev, rgb: undefined, win: winMeta(lastForeground), decision: { kind: 'region' } });
     return ev;
   }
 
@@ -547,7 +548,7 @@ export function createEngine(opts = {}) {
   function pushNow({ reason = 'manual' } = {}) {
     const ev = eventRing[eventRing.length - 1];
     if (!ev) return null;
-    bus.emit('push', { ...ev, rgb: undefined, decision: { kind: 'manual', reason } });
+    bus.emit('push', { ...ev, rgb: undefined, win: winMeta(lastForeground), decision: { kind: 'manual', reason } });
     return { ...ev, rgb: undefined };
   }
 

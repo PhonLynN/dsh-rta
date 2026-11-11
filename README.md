@@ -2,7 +2,10 @@
 
 给 DSH 装一双实时的眼睛和一张嘴：**看见屏幕 → 本地算法筛选 → 只把有信息的画面交给会话模型 → 图片用完即省略、文字长期保留**。
 
-当前状态：**后端层（采集 / 打分 / 选择 / 拼图 / 录像 / 存储 / 工具）已跑通**，22 个单测（10 算法 + 5 引擎 + 6 插件）全过，headless 引擎可独立运行。
+当前状态：**「启用即持续注入」已落地并在真机实测生效**——`rta_start` 之后不需要模型主动调工具，
+屏幕状态会以 runtime-context 快照的形式自动进入会话（前台窗口、活动强度、事件时间线），
+每轮首步还会在预算内附一张拼图。后端层（采集 / 打分 / 选择 / 拼图 / 录像 / 存储 / 工具）全跑通，
+42 个离线单测全过（10 算法 + 6 引擎 + 7 插件 + 17 注入面 + 2 存储）。
 UI/UX（悬浮窗、对话 / 轨迹面板、插件配置页）按计划放在下一阶段。
 
 平台：Windows 10/11（GDI + koffi 调 Win32）。插件侧只依赖 `@deepseek-ai/dsh-tools`（可选）。
@@ -16,6 +19,37 @@ UI/UX（悬浮窗、对话 / 轨迹面板、插件配置页）按计划放在下
 - 图片堆在会话里：历史越长越贵，逐张卸载还会每轮破坏前缀缓存。
 
 RTA 的做法：**本地永远在采集，但只有通过筛选的画面才进上下文；进上下文的是拼图，不是原图；拼图用完由 `image/offload` 一次性省略；文字（时间轴、圈画、台词、笔记）永久保留。**
+
+**默认是「推」不是「拉」**：启用后宿主每步都会重新 assemble 一段 runtime context，RTA 只在
+「屏幕状态真的变了」时更新它；文本不变就零消息、零缓存破坏。模型不需要轮询工具就知道用户在看什么。
+
+---
+
+## 持续注入（启用即注入）
+
+`rta_start` 之后，注入器（1Hz）把活缓冲渲染成一段短文本，只有在满足节流时才会发布新文本：
+
+```
+〔RTA 屏幕感知 · 自动注入，非用户消息〕
+前台：main.js — Visual Studio Code [Code.exe]
+状态：最近 1 分钟内有变化
+最近 2 分钟：明显变化 ×3 · 持续变化（滚动/播放） ×1
+时间线（本地时间）：
+- 14:32:10 明显变化（强度 46） → 窗口「Chrome」
+- 14:33:02 持续变化（滚动/播放）
+需要原始画面：rta_look；更早历史：rta_recall。
+```
+
+两条宿主通道（`src/host/channel.js` 自动探测、可降级）：
+
+| 通道 | 用法 | 内容 | 节流 |
+| --- | --- | --- | --- |
+| 文字（主） | `systemPrompt.context({name:'rta:screen', order:205, interpolate:false, text})` | 上面那段文本；宿主**只在文本变化时**落一条 `runtime-context` 快照并声明旧快照被取代 | 文本相同不发布；`minIntervalMs=4000`；`maxPerMinute=8` |
+| 图片（稀缺） | `agent/pre-step` prepend 追加一条 `plugin:dsh-rta` 消息 | 每轮**首步**最多一张拼图（≤4 帧、≤400 tokens），带一句说明文字 | `minIntervalMs=45000`、10 分钟 ≤6 张、在飞 ≤1 |
+
+设计约束（`docs/review/03-target-architecture.md`）：只追加尾部不改历史、自动流永不唤醒会话、
+单槽替换不排队、文字必带图片稀缺、幂等节流、全部硬封顶。子代理会话会被过滤（只服务绑定会话）。
+注入的图同样走 `image/offload` 预算，不会在会话里堆积。
 
 ---
 
@@ -41,8 +75,10 @@ src/
   native/gdiplus.js    GDI+ JPEG 编码（基线帧 ~14–23KB/帧，0.6ms）
   native/koffi.js      定位宿主自带的 koffi（不新增依赖）
   native/gdiplus.js    GDI+ JPEG 编码（基线帧 ~14–23KB/帧，0.6ms）
-  host/                DSH 宿主胶水：defineTool、offload、service、runtime
-  tools/               8 个模型工具（spec + handler）
+  host/                DSH 宿主胶水：defineTool、offload、service、runtime、
+                       live-buffer（环形活缓冲+digest）、injector（节流/预算）、
+                       channel（systemPrompt.context + agent/pre-step）、lifecycle、messages
+  tools/               9 个模型工具（spec + handler）
 bin/rta-run.mjs        headless CLI（不开 DSH 也能测采集与算法）
 bin/rta-smoke.mjs      真机冒烟：起引擎 → 出真拼图 → 文本回捞
 test/                  node --test，零依赖
@@ -76,7 +112,7 @@ test/                  node --test，零依赖
 | `rta_region` | 拿用户圈画区域（可指定 regionId），附 bbox 与起止时间 |
 | `rta_recall` | 按时间范围 / 类型回捞历史记录，`images=true` 时最多附 3 张旧图 |
 | `rta_note` | 把一句观察写进当前会话的笔记（文字永久保留） |
-| `rta_sessions` | 列出历史 RTA 会话与保留期 || `rta_sessions` | 列出历史 RTA 会话与保留期 |
+| `rta_sessions` | 列出历史 RTA 会话与保留期 |
 | `rta_purge` | 提前清理已经总结成文字的图片/视频（`keepMinutes` 默认保留 2 分钟，保留 index/notes/annotations；正常保留期仍是 24h） |
 
 ## 配置
@@ -103,19 +139,42 @@ test/                  node --test，零依赖
   "retentionHours": 24,
   "imageTrigger": 8,
   "imageKeep": 3,
-  "maxSheetTokens": 560
+  "maxSheetTokens": 560,
+  "inject": {
+    "enabled": true,
+    "minIntervalMs": 4000,
+    "maxPerMinute": 8,
+    "maxEvents": 4,
+    "maxLines": 8,
+    "maxTextTokens": 400,
+    "eventTtlMs": 120000,
+    "staleMs": 15000,
+    "image": {
+      "enabled": true,
+      "minIntervalMs": 45000,
+      "windowMs": 600000,
+      "maxPerWindow": 6,
+      "maxInFlight": 1,
+      "maxFrames": 4,
+      "maxSheetTokens": 400
+    }
+  }
 }
 ```
 
 ## 开发 / 自测
 
 ```bash
-node --test test/*.test.mjs        # 19 个离线测试，不抓屏
+node --test test/*.test.mjs        # 42 个离线测试，不抓屏（宿主/沙箱里 spawn 受限时逐文件跑）
+node test/live.test.mjs            # 只跑注入面（live-buffer / injector / channel / lifecycle）
 node bin/rta-run.mjs --seconds=10  # headless：打印 cpu / tickHz / 帧数 / 事件数 / manifest
 node bin/rta-smoke.mjs             # 真机冒烟：起引擎 → 出拼图 → 回捞文本
-node _probe/cold_e2e.mjs           # 冷启动端到端：假 ctx 跑真实插件入口 + 8 个工具
+node _probe/cold_e2e.mjs           # 冷启动端到端：假 ctx 跑真实插件入口 + 9 个工具
 node bin/rta-sync.mjs              # 把 workspace 源码同步到已安装的插件目录
 ```
+
+> 在某些受限环境里 `node --test` 会因 test runner 无法给每个测试文件 spawn 子进程而报
+> `spawn EPERM`；这不是测试失败，直接 `node test/<name>.test.mjs` 逐个运行即可。
 
 > 注意：`plugin_manager install_bundle` 用 `file:` 安装时，pnpm 留下的是**安装时刻的
 > 硬链接快照**——运行中的 DSH 读的是 `~/.dsh/profiles/<profile>/node_modules/dsh-rta`，
@@ -130,7 +189,8 @@ node bin/rta-sync.mjs              # 把 workspace 源码同步到已安装的�
 
 - 采集目前是 GDI；下一步评估 ffmpeg `ddagrab`/DXGI 降 CPU 与多屏支持（koffi 已就绪，先不引外部依赖）。
 - OCR 读字（Windows.Media.Ocr，本地零下载）已做可行性验证，待接入自动管线；字幕 / ASR / 视频秒数识别 / 视觉笔记生成随后（设计已定：字幕轨 > ASR > 硬字幕 OCR；本地只做 OCR 读字，不跑本地小模型）。
-- 热键语义：`Ctrl+Alt` 召唤一次并持续启用（未启用时生效，启用中不重复召唤）、`Shift+Ctrl+Alt` 圈画、`Ctrl+Tab` 退出本次 RTA、`Esc` 取消正在画的圈。召唤通过 `ctx.agents` 推 notice 给当前会话（`src/host/summon.js`，source kind 用 `plugin:dsh-rta`），真实按键已实测通过。
+- 热键语义：`Ctrl+Alt` 只在**未启用时**召唤并启用（启用后屏幕状态本来就在自动注入，不需要再召唤）、`Shift+Ctrl+Alt` 圈画、`Ctrl+Tab` 退出本次 RTA、`Esc` 取消正在画的圈。退出后注入器会立刻把「已停止」状态写进上下文，模型不会继续以为在录。召唤通过 `ctx.agents` 推 notice 给当前会话（`src/host/summon.js`，source kind 用 `plugin:dsh-rta`），真实按键已实测通过。
+- 注入通道依赖宿主能力：有 `systemPrompt.context` 时走文本快照（主通道），有 `agent/pre-step` 时走每轮首步截图；两者都没有时自动降级为纯 pull（只保留 `rta_look`）。实测环境：dsh-desktop 0.2.2-rc.1 → `channel=context+pre-step`。
 - 客户端 UI（悬浮窗、对话 / 轨迹 tab、插件配置页）未做，按计划后置。
 - 仅 Windows。
 

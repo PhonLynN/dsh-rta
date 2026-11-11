@@ -105,7 +105,8 @@ export async function start(ctx, rt) {
         ? `floating window: on (${rt.overlay.endpoint ?? '?'}) — always on top, click-through card, drag by the header.`
         : 'floating window: unavailable (run `node scripts/install-overlay.mjs` to install the Electron runtime).',
       'RTA now serves this session only; other conversations get a notice until rta_stop (single-session binding).',
-      'call rta_look to see the screen; frames are stored locally, images expire 24h after the session ends.',
+      'continuous screen awareness: ON — from now on the screen state is injected into this conversation automatically (a short runtime-context snapshot whenever something changes), so you do not need to call rta_look to know what the user is doing. rta_look is only for a fresh close-up; screenshots are also attached at the start of a turn (at most one per turn, budgeted).',
+      'turn it off with inject.enabled=false (text) or inject.image.enabled=false (screenshots) in the config, or fully with rta_stop. frames are stored locally and images expire 24h after the session ends.',
     ].join('\n');
     return { text };
   } catch (err) {
@@ -145,6 +146,13 @@ export function status(ctx, rt) {
       : 'video: off (archiveMode=jpeg)',
     `frames: archived=${s.capture.archived ?? 0} events=${s.session?.counts?.events ?? 0}`,
     rt.bound ? `bound session: ${rt.bound.sessionId}` : 'bound session: none (rta_start binds the caller)',
+    (() => {
+      let live = null;
+      try { live = rt.lifecycle?.status?.() ?? null; } catch { live = null; }
+      if (!live) return 'injection: not attached (pull-only: call rta_look)';
+      const last = live.text?.lastPublishAt ? ` last=${iso(live.text.lastPublishAt)}` : '';
+      return `injection: ${live.enabled ? 'on' : 'off'} channel=${live.channel} published=${live.text?.publishes ?? 0}${last} screenshots=${live.image?.injected ?? 0}${live.lastError ? ` lastError=${String(live.lastError).slice(0, 160)}` : ''}`;
+    })(),
     rt.overlay
       ? `floating window: ${rt.overlay.running ? 'on' : 'off'} endpoint=${rt.overlay.endpoint ?? 'n/a'}`
       : 'floating window: not started',

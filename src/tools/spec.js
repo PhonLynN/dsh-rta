@@ -60,10 +60,12 @@ export const TOOL_NAMES = Object.freeze({
 export function startSpec() {
   return {
     name: TOOL_NAMES.start,
-    description: 'Start RTA screen capture (the "eyes"). Frames are stored locally and expire 24h after '
-      + 'the session ends; only the moments you ask for with rta_look are sent to you. Idempotent: '
-      + 'returns the current session if already recording. Binds RTA to the calling session — RTA serves '
-      + 'only one session at a time, and while recording a global always-on-top floating window shows its status.',
+    description: 'Start RTA screen capture (the "eyes"). Once started, the screen state is injected into this '
+      + 'conversation automatically (a short runtime-context snapshot whenever something noticeable changes, '
+      + 'plus at most one budgeted screenshot at the start of a turn) — you do NOT need to call rta_look to '
+      + 'know what the user is doing. Frames are stored locally and expire 24h after the session ends. '
+      + 'Idempotent: returns the current session if already recording. Binds RTA to the calling session — RTA '
+      + 'serves only one session at a time, and while recording a global always-on-top floating window shows its status.',
     parameters: {},
     output: TEXT_OUTPUT,
     timeoutMs: 30_000,
@@ -90,7 +92,8 @@ export function statusSpec() {
   return {
     name: TOOL_NAMES.status,
     description: 'Read RTA status without sending any image: capture rate, session id/dir, frame counts, '
-      + 'current foreground window, recent selected moments, last error.',
+      + 'current foreground window, recent selected moments, automatic injection stats (channel, publish '
+      + 'count, injected screenshots), last error.',
     parameters: {},
     output: TEXT_OUTPUT,
     timeoutMs: 10_000,
@@ -103,10 +106,11 @@ export function lookSpec() {
     name: TOOL_NAMES.look,
     description: 'See what is on the user\'s screen now: the most recently selected moments are packed '
       + 'into one numbered image sheet, with a timestamped index. Starts capture if it is not running. '
-      + 'Use when the user says "look at this", after a summon, or before answering a question about '
-      + 'what they are doing. Images are 200-600 tokens each; ask for 1-2 frames unless the change '
-      + 'matters over time. If RTA is currently bound to a different session this returns a notice instead '
-      + 'of stealing that capture.',
+      + 'While RTA is running the screen state is already injected automatically — use this only when you '
+      + 'need a fresh close-up or more detail than the injected summary, not as a polling loop. Also useful '
+      + 'when the user says "look at this" or after a summon. Images are 200-600 tokens each; ask for 1-2 '
+      + 'frames unless the change matters over time. If RTA is currently bound to a different session this '
+      + 'returns a notice instead of stealing that capture.',
     parameters: {
       count: {
         type: 'integer',

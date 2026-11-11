@@ -21,6 +21,13 @@ import * as handlers from './handlers.js';
 const CAN_BIND = new Set(['rta_start', 'rta_look', 'rta_region']);
 
 /**
+ * 输出是「文字 + 图片」的工具。闸门拒绝时也必须遵守 output schema
+ * （images 是 required），否则宿主会判 invalid output，整个调用变成一条
+ * `missing required property "value.images"` 的报错 —— 用户看到的就是工具坏了。
+ */
+const IMAGE_TOOLS = new Set(['rta_look', 'rta_region']);
+
+/**
  * @param {(spec: object) => object} defineTool 宿主的 defineTool（或兜底实现）
  * @param {object} ctx 宿主上下文（出图用）
  * @param {object} rt  host/runtime.js 的 runtime
@@ -66,7 +73,11 @@ export function rtaTools(defineTool, ctx, rt) {
         // 单会话闸门：已绑定且调用方是另一个会话 → 拒绝并给切换办法
         try {
           const gate = rt.gateTool?.(name, exec?.agent);
-          if (gate && gate.ok === false) return { text: gate.text };
+          if (gate && gate.ok === false) {
+            return IMAGE_TOOLS.has(name)
+              ? { text: gate.text, images: [] }
+              : { text: gate.text };
+          }
         } catch { /* 闸门本身出错不阻塞工具 */ }
 
         const out = run(args);

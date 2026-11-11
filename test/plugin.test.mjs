@@ -3,8 +3,9 @@
  *
  * 覆盖：
  *  - 插件契约：inject 只有 tools；apply 不抛；返回可调用的 disposer；
- *  - 八个工具都注册了，schema 能编译，output.render 可用；
+ *  - 九个工具都注册了，schema 能编译，output.render 可用；
  *  - rta_status 在未启动时给的是人话；
+ *  - 单会话闸门拒绝时，图片工具仍然满足 output schema（回归：missing images）；
  *  - image/offload 的计划逻辑（RTA 参数 keep=3 / trigger=8）。
  */
 
@@ -16,6 +17,8 @@ import { join } from 'node:path';
 
 import { name, inject, apply } from '../src/index.js';
 import { TOOL_NAMES } from '../src/tools/spec.js';
+import { rtaTools } from '../src/tools/index.js';
+import { defineToolCompat } from '../src/host/define-tool.js';
 import { planOffload, planOffloadWithTrigger } from '../src/host/offload.js';
 import { readRtaConfig } from '../src/config.js';
 import { createRuntime } from '../src/host/runtime.js';
@@ -77,6 +80,26 @@ test('rta_status answers in plain language while idle', async () => {
   const value = await status.execute({});
   assert.match(value.text, /not running/);
   dispose();
+});
+
+test('single-session gate keeps an image tool output schema-valid', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'rta-gate-'));
+  try {
+    const { ctx } = fakeCtx();
+    const rt = createRuntime({ ctx, env: { DSH_RTA_HOME: dir } });
+    assert.equal(rt.bindAgent({ session: { id: 'session-a' }, status: 'idle' }), 'session-a');
+
+    const tools = rtaTools(defineToolCompat, ctx, rt);
+    const look = tools.find((t) => t.name === TOOL_NAMES.look);
+    // 另一个会话调用：闸门拒绝，但返回形状必须带 images（IMAGE_OUTPUT 里它是 required）
+    const value = await look.execute({}, { agent: { session: { id: 'session-b' }, status: 'idle' } });
+    assert.match(value.text, /另一个会话/);
+    assert.deepEqual(value.images, []);
+
+    await rt.dispose();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('offload plan keeps the newest images and respects trigger/keep', () => {

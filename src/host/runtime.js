@@ -16,6 +16,7 @@ import { readRtaConfig, engineConfig, rtaConfigPath } from '../config.js';
 import { createSummoner } from './summon.js';
 import { serviceOf } from './service.js';
 import { createOverlayHost } from './overlay.js';
+import { createLiveLifecycle } from './lifecycle.js';
 
 /** 只有这些工具算「RTA 实时面」——它们受单会话绑定约束。 */
 const LIVE_TOOLS = new Set(['rta_start', 'rta_look', 'rta_region', 'rta_note']);
@@ -35,6 +36,10 @@ export function createRuntime({ ctx, env = process.env } = {}) {
    * rta_start 成功时绑定调用方会话；实时面工具从别的会话调用会被拒绝。
    */
   let bound = null; // { sessionId, agent }
+  /** 引擎/绑定变化的外部钩子（持续注入用；不在这里直接创建注入器，保持运行时轻量）。 */
+  const engineHooks = new Set();
+  const bindHooks = new Set();
+  let live = null;
 
   const logger = {
     info: (m) => { try { ctx?.logger?.info?.(m); } catch { /* ignore */ } },
@@ -73,17 +78,42 @@ export function createRuntime({ ctx, env = process.env } = {}) {
     }
   }
 
+  /** 订阅「引擎创建/可订阅」事件：注册时若引擎已存在立即回调；返回取消函数。 */
+  function onEngine(fn) {
+    if (typeof fn !== 'function') return () => {};
+    engineHooks.add(fn);
+    if (engine) {
+      try { fn(engine); } catch (err) { logger.warn(`[rta] engine hook failed: ${err?.message ?? err}`); }
+    }
+    return () => { engineHooks.delete(fn); };
+  }
+
+  /** 订阅单会话绑定变化：fn(agent|null)。 */
+  function onBind(fn) {
+    if (typeof fn !== 'function') return () => {};
+    bindHooks.add(fn);
+    return () => { bindHooks.delete(fn); };
+  }
+
+  function emitBind(agent) {
+    for (const fn of [...bindHooks]) {
+      try { fn(agent); } catch (err) { logger.warn(`[rta] bind hook failed: ${err?.message ?? err}`); }
+    }
+  }
+
   /** 把 RTA 绑到某个 agent 所在会话（rta_start / Ctrl+Alt 召唤时调用）。 */
   function bindAgent(agent) {
     const sessionId = sessionIdOf(agent);
     if (!sessionId) return null;
     bound = { sessionId, agent };
     try { summoner.rememberAgent(agent); } catch { /* ignore */ }
+    emitBind(agent);
     return sessionId;
   }
 
   function releaseBinding() {
     bound = null;
+    emitBind(null);
   }
 
   function boundSessionId() {
@@ -156,6 +186,10 @@ export function createRuntime({ ctx, env = process.env } = {}) {
         engine.on('exit', () => { void stop({ reason: 'exit' }); });
         engine.on('stop', () => { if (!disposed) summoner.watch(); });
       } catch { /* 引擎事件总线不可用时，只剩 idle 轮询路径 */ }
+      // 引擎刚建好：把「持续注入」的订阅挂上去（lifecycle 在 attach 时已注册钩子）。
+      for (const fn of [...engineHooks]) {
+        try { fn(engine); } catch (err) { logger.warn(`[rta] engine hook failed: ${err?.message ?? err}`); }
+      }
     }
     return engine;
   }
@@ -207,9 +241,29 @@ export function createRuntime({ ctx, env = process.env } = {}) {
     if (!disposed) summoner.watch();
   }
 
+  /**
+   * 装配「启用即持续注入」：文本走 systemPrompt.context，图片走 agent/pre-step。
+   * 幂等；宿主能力不足时 lifecycle 自己降级成 pull，不影响工具面。
+   */
+  function attachLive() {
+    if (disposed) return null;
+    if (!live) {
+      try {
+        live = createLiveLifecycle({ rt: api, logger });
+        live.attach();
+      } catch (err) {
+        logger.warn(`[rta] live injection attach failed: ${err?.message ?? err}`);
+        live = null;
+      }
+    }
+    return live;
+  }
+
   async function dispose() {
     if (disposed) return;
     disposed = true;
+    try { live?.dispose(); } catch { /* ignore */ }
+    live = null;
     summoner.dispose();
     await stopOverlay();
     try {
@@ -233,6 +287,11 @@ export function createRuntime({ ctx, env = process.env } = {}) {
     stop,
     watchForSummon,
     dispose,
+    /** 持续注入的装配入口（index.js 在注册完工具后调用一次）。 */
+    attachLive,
+    onEngine,
+    onBind,
+    get lifecycle() { return live; },
     /** 工具调用时把调用方 agent 记下来（召唤/主动推送要用）。 */
     rememberAgent: (agent) => summoner.rememberAgent(agent),
     rememberSession: (id) => summoner.rememberSession(id),

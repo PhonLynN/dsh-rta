@@ -60,6 +60,15 @@ async function registerAll(ctx) {
 
   wireImageOffload(ctx, rt, disposers);
 
+  // 「启用即持续注入」：文本通道 systemPrompt.context + 图片通道 agent/pre-step。
+  // 必须排在 wireImageOffload 之后：自动注入的截图也要走同一条 offload 预算。
+  // 宿主能力不足时 lifecycle 自己降级成 pull，不影响工具面。
+  try {
+    rt.attachLive();
+  } catch (e) {
+    try { ctx?.logger?.warn?.(`[dsh-rta] live injection failed: ${e?.message ?? e}`); } catch { /* ignore */ }
+  }
+
   // 悬浮窗（client half）的数据面：GET /api/dsh-rta/state、POST /api/dsh-rta/say。
   // connection 服务缺失时静默降级（插件照常工作，只是没有浮窗数据）。
   try {

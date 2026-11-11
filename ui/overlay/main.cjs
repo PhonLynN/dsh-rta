@@ -54,7 +54,7 @@ const TOKEN = process.env.RTA_OVERLAY_TOKEN || '';
 const CARD_MESSAGES = { width: 420, height: 520 };
 const CARD_COMPOSER = { width: 420, height: 98 };
 const CARD_GAP = 14;
-const PAD = 40; // 窗口内边距（只给外阴影留空间，不是卡片间距；CARD_GAP 仍是 14）。设计外阴影 blur 20 + 下偏移 6，Chromium 尾部约 3σ≈30px，20px 会被窗口边界裁成直边
+const PAD = 20; // 窗口内边距（只给外阴影留空间，不是卡片间距；CARD_GAP 仍是 14）
 const WIN_WIDTH = CARD_MESSAGES.width + PAD * 2; // 460
 const WIN_HEIGHT = PAD + CARD_MESSAGES.height + CARD_GAP + CARD_COMPOSER.height + PAD; // 672
 

@@ -29,19 +29,51 @@ export const DEFAULT_RTA_CONFIG = Object.freeze({
   imageTrigger: 8,           // 会话里攒够 8 张图才跑一次 offload
   imageKeep: 3,              // offload 后保留最新 3 张
   maxSheetTokens: 560,       // 单张拼图的 token 预算上限
-  summonPrompt: 'RTA 召唤：用户刚按了 Ctrl+Alt，想让你看当前屏幕。先调用 rta_look 拿最新画面（1–2 帧就够），然后用 1–2 句口语直接说你看到的关键内容；不要列表、不要长篇。',
+  summonPrompt: 'RTA 召唤：用户刚按了 Ctrl+Alt，想让你看当前屏幕。屏幕状态本来就在持续注入；先看上下文，不够再调用 rta_look 拿最新画面，然后用 1–2 句口语直接说你看到的关键内容；不要列表、不要长篇。',
   summonCooldownMs: 1500,    // 两次召唤之间的最小间隔，防按住键重复触发
+
+  /**
+   * 持续注入（默认开）：「启用即持续注入」——rta_start 之后，屏幕摘要会自动进入
+   * 当前会话的 runtime context，不需要模型每隔几秒调一次工具。
+   *
+   * 文本通道永不唤醒会话（只在本来要跑的下一步生效）；图片更稀缺，每轮最多一张。
+   * 所有旋钮都可关：inject.enabled=false 退回纯 pull（旧的 rta_look 模式）；
+   * inject.image.enabled=false 只注入文字、不注入截图。
+   */
+  inject: {
+    enabled: true,
+    minIntervalMs: 4000,      // 两条文本注入之间的最小间隔（防抖屏刷历史）
+    maxPerMinute: 8,          // 每分钟最多落几条 runtime-context
+    maxEvents: 4,             // 时间线最多列几条事件
+    maxLines: 8,              // digest 总行数上限
+    maxTextTokens: 400,       // digest 目标 token 预算（按字符近似）
+    eventTtlMs: 120_000,      // 时间线只覆盖最近 2 分钟
+    staleMs: 15_000,          // 超过这么久没有采集心跳 → 文本里标注「数据不新鲜」
+    image: {
+      enabled: true,          // 每轮开头自动带一张屏幕拼图
+      minIntervalMs: 45_000,  // 两张自动截图至少间隔 45s
+      windowMs: 600_000,      // 预算窗口 10 分钟
+      maxPerWindow: 6,        // 每 10 分钟最多 6 张
+      maxInFlight: 1,         // 同时只允许一张在飞
+      maxFrames: 4,           // 拼图帧数
+      maxSheetTokens: 400,    // 单张拼图 token 预算
+    },
+  },
 });
 
 export function rtaConfigPath(env = process.env) {
   return join(rtaHome(env), 'config.json');
 }
 
-/** 读配置：深合并 capture，其余键浅合并；类型不对的键忽略。 */
+/** 读配置：深合并 capture 与 inject，其余键浅合并；类型不对的键忽略。 */
 export function readRtaConfig(env = process.env) {
   const base = {
     ...DEFAULT_RTA_CONFIG,
     capture: { ...DEFAULT_RTA_CONFIG.capture },
+    inject: {
+      ...DEFAULT_RTA_CONFIG.inject,
+      image: { ...DEFAULT_RTA_CONFIG.inject.image },
+    },
   };
   let raw = null;
   try {
@@ -66,6 +98,24 @@ export function readRtaConfig(env = process.env) {
       }
       const v = Number(value);
       if (Number.isFinite(v) && v >= 0) base.capture[key] = v;
+    }
+  }
+  // inject 只认两类值：布尔（enabled）与有限非负数（间隔/上限/预算）。
+  if (raw.inject && typeof raw.inject === 'object') {
+    if (typeof raw.inject.enabled === 'boolean') base.inject.enabled = raw.inject.enabled;
+    for (const [key, value] of Object.entries(raw.inject)) {
+      if (key === 'enabled' || key === 'image') continue;
+      const v = Number(value);
+      if (Number.isFinite(v) && v >= 0) base.inject[key] = v;
+    }
+    const image = raw.inject.image;
+    if (image && typeof image === 'object') {
+      if (typeof image.enabled === 'boolean') base.inject.image.enabled = image.enabled;
+      for (const [key, value] of Object.entries(image)) {
+        if (key === 'enabled') continue;
+        const v = Number(value);
+        if (Number.isFinite(v) && v >= 0) base.inject.image[key] = v;
+      }
     }
   }
   return base;
