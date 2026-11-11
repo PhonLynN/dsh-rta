@@ -1,5 +1,5 @@
 /**
- * tools/spec.js — RTA 八个工具的契约（**不含 execute**）。
+ * tools/spec.js — RTA 十个工具的契约（**不含 execute**）。
  *
  * 宿主管参数走 schema：schema 没声明的参数会被静默丢掉，所以 handler 读的
  * 每个参数都必须在这里出现。宿主只支持 string/number/integer/boolean/null/
@@ -49,6 +49,7 @@ export const TOOL_NAMES = Object.freeze({
   start: 'rta_start',
   stop: 'rta_stop',
   status: 'rta_status',
+  summarize: 'rta_summarize',
   look: 'rta_look',
   region: 'rta_region',
   recall: 'rta_recall',
@@ -63,13 +64,14 @@ export function startSpec() {
     description: 'Start RTA screen capture (the "eyes"). Once started, the screen state is injected into this '
       + 'conversation automatically (a short runtime-context snapshot whenever something noticeable changes, '
       + 'plus at most one budgeted HD screenshot at the start of a turn) — you do NOT need to call rta_look to '
-      + 'know what the user is doing. A background summarizer subagent is also started while recording: it writes '
-      + 'a rolling 2-4 sentence summary of what is happening on screen (note name="screen-log"), and the newest '
-      + 'summary is attached at the start of each turn. The main conversation is never interrupted or woken by '
-      + 'this — summaries arrive passively with the next turn. Frames are stored locally and expire 24h after '
-      + 'the session ends. Idempotent: returns the current session if already recording. Binds RTA to the calling '
-      + 'session — RTA serves only one session at a time, and while recording a global always-on-top floating '
-      + 'window shows its status.',
+      + 'know what the user is doing. A background summarizer subagent is also started while recording (one '
+      + 'persistent child for the whole session): it writes a rolling 2-4 sentence summary of what is happening '
+      + 'on screen (note name="screen-log"), refreshed periodically, on dense screen changes, and on demand via '
+      + 'rta_summarize; the newest summary is attached at the start of each turn. The main conversation is never '
+      + 'interrupted or woken by this — summaries arrive passively with the next turn. rta_stop clears that '
+      + 'subagent. Frames are stored locally and expire 24h after the session ends. Idempotent: returns the '
+      + 'current session if already recording. Binds RTA to the calling session — RTA serves only one session at '
+      + 'a time, and while recording a global always-on-top floating window shows its status.',
     parameters: {},
     output: TEXT_OUTPUT,
     timeoutMs: 30_000,
@@ -80,9 +82,10 @@ export function startSpec() {
 export function stopSpec() {
   return {
     name: TOOL_NAMES.stop,
-    description: 'Stop RTA capture and end the session. Also closes the floating window and releases the '
-      + 'single-session binding, so another conversation can start RTA. Returns the session summary (id, dir, '
-      + 'counts, image retain-until). Text records stay available via rta_recall; images expire 24h after the session ends.',
+    description: 'Stop RTA capture and end the session. Also closes the floating window, clears the summary '
+      + 'subagent, and releases the single-session binding, so another conversation can start RTA. Returns the '
+      + 'session summary (id, dir, counts, image retain-until). Text records stay available via rta_recall; '
+      + 'images expire 24h after the session ends.',
     parameters: {
       reason: { type: 'string', description: 'Why the session ended; stored in the manifest (default "explicit").' },
     },
@@ -97,11 +100,37 @@ export function statusSpec() {
     name: TOOL_NAMES.status,
     description: 'Read RTA status without sending any image: capture rate, session id/dir, frame counts, '
       + 'current foreground window, recent selected moments, automatic injection stats (channel, publish '
-      + 'count, injected HD screenshots), background summarizer stats (provider, starts, errors, summary age), '
-      + 'last error.',
+      + 'count, injected HD screenshots), background summarizer stats (provider, child id, prompts, errors, '
+      + 'summary age, last trigger), last error.',
     parameters: {},
     output: TEXT_OUTPUT,
     timeoutMs: 10_000,
+    isConcurrencySafe() { return true; },
+  };
+}
+
+export function summarizeSpec() {
+  return {
+    name: TOOL_NAMES.summarize,
+    description: 'Ask the background summarizer subagent for a FRESH screen summary right now and return it. '
+      + 'The summarizer normally runs on its own (periodically, and when dense screen changes happen) and '
+      + 'writes a rolling 2-4 sentence summary into note "screen-log"; this tool is the on-demand override: '
+      + 'it nudges the same persistent subagent, waits up to waitMs for it to write the new summary, and '
+      + 'returns that text with its age. Use it before answering anything that depends on what the user is '
+      + 'doing right now, after a long period of activity, or when the injected summary looks stale. It never '
+      + 'interrupts or wakes the main conversation.',
+    parameters: {
+      waitMs: {
+        type: 'integer',
+        description: 'How long to wait for the new summary, 0-60000 (default 25000). 0 = just nudge and return immediately.',
+      },
+      reason: {
+        type: 'string',
+        description: 'Optional: why the summary is requested. Recorded in the summarizer log.',
+      },
+    },
+    output: TEXT_OUTPUT,
+    timeoutMs: 40_000,
     isConcurrencySafe() { return true; },
   };
 }

@@ -19,7 +19,7 @@ import { createOverlayHost } from './overlay.js';
 import { createLiveLifecycle } from './lifecycle.js';
 
 /** 只有这些工具算「RTA 实时面」——它们受单会话绑定约束。 */
-const LIVE_TOOLS = new Set(['rta_start', 'rta_look', 'rta_region', 'rta_note']);
+const LIVE_TOOLS = new Set(['rta_start', 'rta_look', 'rta_region', 'rta_note', 'rta_summarize']);
 
 /** 会话 id 只露尾部，避免把整串 id 写进给模型看的拒绝文案里。 */
 function shortSession(id) {

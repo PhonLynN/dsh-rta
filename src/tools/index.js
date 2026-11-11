@@ -13,12 +13,13 @@
  */
 
 import {
-  startSpec, stopSpec, statusSpec, lookSpec, regionSpec, recallSpec, noteSpec, sessionsSpec, purgeSpec,
+  startSpec, stopSpec, statusSpec, summarizeSpec, lookSpec, regionSpec, recallSpec, noteSpec,
+  sessionsSpec, purgeSpec,
 } from './spec.js';
 import * as handlers from './handlers.js';
 
 /** 这些调用可能把引擎拉起来；成功后需要把调用方会话绑定上去。 */
-const CAN_BIND = new Set(['rta_start', 'rta_look', 'rta_region']);
+const CAN_BIND = new Set(['rta_start', 'rta_look', 'rta_region', 'rta_summarize']);
 
 /**
  * 输出是「文字 + 图片」的工具。闸门拒绝时也必须遵守 output schema
@@ -38,6 +39,7 @@ export function rtaTools(defineTool, ctx, rt) {
     [startSpec, () => handlers.start(ctx, rt)],
     [stopSpec, (args) => handlers.stop(ctx, rt, args)],
     [statusSpec, () => handlers.status(ctx, rt)],
+    [summarizeSpec, (args) => handlers.summarize(ctx, rt, args)],
     [lookSpec, (args) => handlers.look(ctx, rt, args)],
     [regionSpec, (args) => handlers.region(ctx, rt, args)],
     [recallSpec, (args) => handlers.recall(ctx, rt, args)],

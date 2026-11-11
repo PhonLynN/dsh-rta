@@ -6,7 +6,7 @@
 屏幕状态会以 runtime-context 快照的形式自动进入会话（前台窗口、活动强度、事件时间线），
 每轮首步还会附一张**裁窗后的高清帧**（从 2560×1440 原生录像抽帧，按预算缩放）和**后台子代理刚写的摘要**（主会话全程不被唤醒）。
 后端层（采集 / 打分 / 选择 / 拼图 / 录像 / 存储 / 工具）全跑通，
-68 个离线单测全过（10 算法 + 6 引擎 + 7 插件 + 19 注入面 + 14 高清帧 + 10 摘要子代理 + 2 存储）。
+73 个离线单测全过（10 算法 + 6 引擎 + 7 插件 + 19 注入面 + 14 高清帧 + 15 摘要子代理 + 2 存储）。
 UI/UX（悬浮窗、对话 / 轨迹面板、插件配置页）按计划放在下一阶段。
 
 平台：Windows 10/11（GDI + koffi 调 Win32）。插件侧只依赖 `@deepseek-ai/dsh-tools`（可选）。
@@ -69,10 +69,11 @@ RTA 的做法：**本地永远在采集，但只有通过筛选的画面才进�
 
 主会话不能被打断，所以摘要不在主会话里做：
 
-- `rta_start` 后，RTA 用 `ctx.subagents.startActivation({provider, delivery:'caller', request:{prompt, parent}})` 起一个后台子代理；`delivery:'caller'` 意味着**结算消息不回父会话，零唤醒**（`dsh-subagent` 的 `notifySettlement` 对 caller 直接返回）。
-- 每 `intervalMs=45000`（10 分钟 ≤6 次）在屏幕有新事件时起一次任务：子代理读 digest、必要时 `rta_look(count=1)`，然后 `rta_note({name:'screen-log', text})` 写 2–4 句中文摘要；prompt 会带上一版摘要保持连续。
-- 主会话在每个新回合的 step 1 主动读 `notes/` 下最新的 `screen-log`，把「刚刚 / 约 N 分钟前」的摘要作为一条插件消息附上；`rta_start` 当轮还会附一条「已启动」告知。
+- `rta_start` 后，RTA 用 `ctx.subagents.startActivation({provider, childId, delivery:'caller', request:{prompt, parent}})` 预留**整个 RTA 会话唯一的常驻 child**；之后每一轮都通过宿主 symbol 通道 `subagents[Symbol.for('dsh.subagent.deliverPrompt')](parent, childId, …)` 把新 prompt 投给同一个 child，不再新建子代理。`rta_stop` / dispose 时 `interrupt` + `drainChildren` 清除它（用户可在 `rta_status` 的 `summarizer.child` 看到它的 id）。
+- 摘要触发有三种：① 周期（`intervalMs=45000`，10 分钟 ≤18 次，digest 不变时跳过）；② 密集事件（cut / 圈画 / 文字变化或强度 ≥18 的帧，2.5 s 防抖、12 s 最小间隔）；③ 主 agent 主动命令 `rta_summarize`（会等子代理写完新摘要再返回，绝不唤醒主会话）。
+- 子代理读 digest、必要时 `rta_look(count=1)`，然后 `rta_note({name:'screen-log', text})` 写 2–4 句中文摘要；prompt 会带上上一版摘要保持连续。主会话在每个新回合的 step 1 主动读 `notes/` 下最新的 `screen-log`，把「刚刚 / 约 N 分钟前」的摘要作为一条插件消息附上；`rta_start` 当轮还会附一条「已启动」告知。
 - 子代理只被放行只读工具（`rta_look` / `rta_region` / `rta_note`），不能 `rta_start` / `rta_stop`；主会话仍然是唯一绑定会话。
+- **零唤醒兜底（宿主缺口）**：continuable child 每轮结束会 settle，下一次投递走 `coldResume()`，而宿主 `coldResume` 没有透传 `delivery:'caller'` → `notifySettlement` 会变成「Background subagent … finished」并 `followup()` 唤醒主会话。RTA 因此在 `manager.notifySettlement` 上装了一个**只针对本插件 childId** 的过滤器（`rta_status` 显示 `guard=on`），并随 child 一起在 stop 时还原；宿主升级后若该方法不在了会自动降级（退回可见的结算通知，但不会崩）。
 
 ---
 
@@ -102,7 +103,7 @@ src/
                        live-buffer（环形活缓冲+digest）、injector（节流/预算）、
                        channel（systemPrompt.context + agent/pre-step）、lifecycle、messages、
                        hd（高清抽帧/裁窗/缩图）、summarizer（后台摘要子代理）
-  tools/               9 个模型工具（spec + handler）
+  tools/               10 个模型工具（spec + handler）
 bin/rta-run.mjs        headless CLI（不开 DSH 也能测采集与算法）
 bin/rta-smoke.mjs      真机冒烟：起引擎 → 出真拼图 → 文本回捞
 test/                  node --test，零依赖
@@ -135,6 +136,7 @@ test/                  node --test，零依赖
 | `rta_look` | 拿一张裁窗高清帧（默认，`hd:false` 回退最近变化点拼图），附时间轴文字 |
 | `rta_region` | 拿用户圈画区域（可指定 regionId），附 bbox 与起止时间 |
 | `rta_recall` | 按时间范围 / 类型回捞历史记录（默认隐藏逐帧索引行），`images=true` 时按窗均分挑 ≤3 个关键时刻附高清帧 |
+| `rta_summarize` | 让后台摘要子代理**立刻**更新摘要并返回（`waitMs` 默认 25 s；不唤醒主会话） |
 | `rta_note` | 把一句观察写进当前会话的笔记（文字永久保留） |
 | `rta_sessions` | 列出历史 RTA 会话与保留期 |
 | `rta_purge` | 提前清理已经总结成文字的图片/视频（`keepMinutes` 默认保留 2 分钟，保留 index/notes/annotations；正常保留期仍是 24h） |
@@ -188,8 +190,13 @@ test/                  node --test，零依赖
       "enabled": true,
       "provider": null,
       "intervalMs": 45000,
-      "maxPer10Min": 6,
-      "timeoutMs": 180000
+      "maxPer10Min": 18,
+      "timeoutMs": 180000,
+      "eventEnabled": true,
+      "eventMinGapMs": 12000,
+      "eventDebounceMs": 2500,
+      "eventMinScore": 18,
+      "demandWaitMs": 25000
     }
   }
 }
@@ -198,13 +205,13 @@ test/                  node --test，零依赖
 ## 开发 / 自测
 
 ```bash
-node --test test/*.test.mjs        # 68 个离线测试，不抓屏（宿主/沙箱里 spawn 受限时逐文件跑）
+node --test test/*.test.mjs        # 73 个离线测试，不抓屏（宿主/沙箱里 spawn 受限时逐文件跑）
 node test/live.test.mjs            # 只跑注入面（live-buffer / injector / channel / lifecycle）
 node test/hd.test.mjs              # 只跑高清帧通道（选帧 / 裁剪 / 缩图 / vf 生成）
 node test/summarizer.test.mjs      # 只跑后台摘要子代理（prompt / delivery / 节流 / 失败路径）
 node bin/rta-run.mjs --seconds=10  # headless：打印 cpu / tickHz / 帧数 / 事件数 / manifest
 node bin/rta-smoke.mjs             # 真机冒烟：起引擎 → 出拼图 → 回捞文本
-node _probe/cold_e2e.mjs           # 冷启动端到端：假 ctx 跑真实插件入口 + 9 个工具
+node _probe/cold_e2e.mjs           # 冷启动端到端：假 ctx 跑真实插件入口 + 10 个工具
 node bin/rta-sync.mjs              # 把 workspace 源码同步到已安装的插件目录
 ```
 
@@ -226,7 +233,7 @@ node bin/rta-sync.mjs              # 把 workspace 源码同步到已安装的�
 - OCR 读字（Windows.Media.Ocr，本地零下载）已做可行性验证，待接入自动管线；字幕 / ASR / 视频秒数识别 / 视觉笔记生成随后（设计已定：字幕轨 > ASR > 硬字幕 OCR；本地只做 OCR 读字，不跑本地小模型）。
 - 热键语义：`Ctrl+Alt` 只在**未启用时**召唤并启用（启用后屏幕状态本来就在自动注入，不需要再召唤）、`Shift+Ctrl+Alt` 圈画、`Ctrl+Tab` 退出本次 RTA、`Esc` 取消正在画的圈。退出后注入器会立刻把「已停止」状态写进上下文，模型不会继续以为在录。召唤通过 `ctx.agents` 推 notice 给当前会话（`src/host/summon.js`，source kind 用 `plugin:dsh-rta`），真实按键已实测通过。
 - 注入通道依赖宿主能力：有 `systemPrompt.context` 时走文本快照（主通道），有 `agent/pre-step` 时走每轮首步截图；两者都没有时自动降级为纯 pull（只保留 `rta_look`）。实测环境：dsh-desktop 0.2.2-rc.1 → `channel=context+pre-step`。
-- 摘要子代理是**一次性 activation**：宿主没有给插件「持续投喂同一个子代理」的公开 API，所以每个间隔（默认 45 s）新起一个 child，prompt 带上上一版摘要保持连续；屏幕剧烈变化时摘要可能滞后 1–2 分钟。子代理 provider 默认 `spawn`，模型路由继承父会话（宿主 policy 不允许时启动失败，会记进 `rta_status` 的 summarizer.lastError）。
+- 摘要子代理整个 RTA 会话只保留一个常驻 child（`rta_status` 的 `summarizer.child` 可见，`rta_stop` 会 interrupt + drain 清除）。宿主 `coldResume` 不透传 `delivery:'caller'`，所以 RTA 在 `manager.notifySettlement` 上装了只针对本 child 的过滤器（`guard=on`）来维持零唤醒——这是宿主版本相关的私有兜底，宿主升级后若接口变化会自动降级为「会收到可见的结算通知」而不是崩溃。周期 45 s（10 分钟 ≤18 次）、密集事件 / `rta_summarize` 会更快触发；屏幕剧烈变化时摘要仍可能滞后 1–2 分钟。子代理 provider 默认 `spawn`，模型路由继承父会话（宿主 policy 不允许时启动失败，会记进 `rta_status` 的 summarizer.lastError）。
 - 高清通道依赖录像轨与窗口 rect：`archiveMode:"jpeg"`、没有 ffmpeg、或事件太旧（帧已不在录像里）时自动退回 512px 拼图；全屏视频等「窗口 rect 不可靠」的场景会退化成整幅缩小（仍比 512px 拼图清晰）。
 - 客户端 UI（悬浮窗、对话 / 轨迹 tab、插件配置页）未做，按计划后置。
 - 仅 Windows。

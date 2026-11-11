@@ -115,6 +115,8 @@ export function createLiveLifecycle({ rt, logger = rt?.logger } = {}) {
         injector.start({ sessionId });
         startNoticePending = true;
         logger?.info?.(`[rta] live buffer armed: ${sessionId ?? 'unknown'}`);
+        // 启动即要一版摘要（可能还没绑定会话，tickOnce 会跳过，下一轮 1Hz tick 重试）。
+        void summarizer.tickOnce({ reason: 'start', force: true }).catch(() => {});
       }));
       engineOffs.push(engine.on('push', (ev) => {
         if (disposed) return;
@@ -124,17 +126,26 @@ export function createLiveLifecycle({ rt, logger = rt?.logger } = {}) {
         } catch (err) {
           noteError('push', err);
         }
+        // 密集事件触发摘要（用户 m01656）：cut/圈选/文字变化或高分事件 → 防抖后问一次子代理。
+        try {
+          summarizer.onScreenEvent(ev, now());
+        } catch (err) {
+          noteError('push-summarizer', err);
+        }
       }));
       engineOffs.push(engine.on('stop', (info) => {
         if (disposed) return;
         buffer.beat({ at: now(), running: false });
         injector.stop(info?.reason ?? 'explicit');
+        // rta 结束：打断并释放这个会话唯一的摘要子代理（用户 m01622）。
+        void summarizer.stop(info?.reason ?? 'explicit').catch((err) => noteError('stop-summarizer', err));
         logger?.info?.(`[rta] live buffer stopped (${info?.reason ?? 'explicit'})`);
       }));
       engineOffs.push(engine.on('exit', () => {
         if (disposed) return;
         buffer.beat({ at: now(), running: false });
         injector.stop('exit');
+        void summarizer.stop('exit').catch((err) => noteError('stop-summarizer', err));
       }));
     } catch (err) {
       noteError('engine-subscribe', err);

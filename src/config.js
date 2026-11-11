@@ -60,14 +60,20 @@ export const DEFAULT_RTA_CONFIG = Object.freeze({
       hd: true,               // 优先从原生录像抽 HD 帧（裁窗+缩图），失败才回落拼图
       hdMaxWidth: 1600,       // HD 帧最大宽度（约 ≤900 tokens）
     },
-    // 后台摘要子代理：rta_start 后自动起，delivery:'caller'（不唤醒主会话），
-    // 把自己写的滚动摘要留在 rta_note(name='screen-log') 里，主会话每轮被动读取。
+    // 后台摘要子代理：rta_start 后自动起一个常驻子代理（整个 RTA 会话复用同一个），
+    // delivery:'caller'（不唤醒主会话），把滚动摘要留在 rta_note(name='screen-log') 里。
+    // 触发方式：周期（intervalMs）/ 密集事件（event*）/ 主 agent 主动命令（rta_summarize）。
     summarizer: {
       enabled: true,
       provider: null,         // null = 自动选（spawn → fork → 第一个已注册 provider）
-      intervalMs: 45_000,     // 两次启动之间的最短间隔
-      maxPer10Min: 6,         // 10 分钟最多启动几次
-      timeoutMs: 180_000,     // 单次子代理兜底超时
+      intervalMs: 45_000,     // 周期触发的最短间隔
+      maxPer10Min: 18,        // 10 分钟最多投递几次（硬预算；含周期/事件/主动命令）
+      timeoutMs: 180_000,     // 单轮子代理兜底超时
+      eventEnabled: true,     // 密集事件也触发摘要
+      eventMinGapMs: 12_000,  // 事件触发之间的最小间隔（防事件洪水）
+      eventDebounceMs: 2_500, // 事件触发防抖窗口（合并连续 cut）
+      eventMinScore: 18,      // 非 cut/region/text/manual 事件按 score 判重要
+      demandWaitMs: 25_000,   // rta_summarize 等待新摘要的最长时间
     },
   },
 });
@@ -132,10 +138,11 @@ export function readRtaConfig(env = process.env) {
     const summarizer = raw.inject.summarizer;
     if (summarizer && typeof summarizer === 'object') {
       if (typeof summarizer.enabled === 'boolean') base.inject.summarizer.enabled = summarizer.enabled;
+      if (typeof summarizer.eventEnabled === 'boolean') base.inject.summarizer.eventEnabled = summarizer.eventEnabled;
       if (typeof summarizer.provider === 'string' && summarizer.provider.trim()) {
         base.inject.summarizer.provider = summarizer.provider.trim();
       }
-      for (const key of ['intervalMs', 'maxPer10Min', 'timeoutMs']) {
+      for (const key of ['intervalMs', 'maxPer10Min', 'timeoutMs', 'eventMinGapMs', 'eventDebounceMs', 'eventMinScore', 'demandWaitMs']) {
         const v = Number(summarizer[key]);
         if (Number.isFinite(v) && v >= 0) base.inject.summarizer[key] = v;
       }

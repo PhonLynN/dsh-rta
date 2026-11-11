@@ -110,7 +110,7 @@ export async function start(ctx, rt) {
         : 'floating window: unavailable (run `node scripts/install-overlay.mjs` to install the Electron runtime).',
       'RTA now serves this session only; other conversations get a notice until rta_stop (single-session binding).',
       'continuous screen awareness: ON — from now on the screen state is injected into this conversation automatically (a short runtime-context snapshot whenever something changes), so you do not need to call rta_look to know what the user is doing. rta_look is only for a fresh close-up; HD screenshots are also attached at the start of a turn (at most one per turn, budgeted).',
-      'background summarizer: ON — a subagent is spawned while recording and writes a rolling 2-4 sentence summary (note name="screen-log"); the newest summary is read and attached at the start of each turn. The main conversation is never interrupted or woken by it.',
+      'background summarizer: ON — ONE persistent subagent for this session writes a rolling 2-4 sentence summary (note name="screen-log"): refreshed periodically, when dense screen changes happen, and on demand via rta_summarize. The newest summary is read and attached at the start of each turn. The main conversation is never interrupted or woken by it, and rta_stop clears that subagent.',
       'turn it off with inject.enabled=false (text) or inject.image.enabled=false (screenshots) in the config, or fully with rta_stop. frames are stored locally and images expire 24h after the session ends.',
     ].join('\n');
     return { text };
@@ -169,7 +169,8 @@ export function status(ctx, rt) {
       const age = Number.isFinite(sum.summaryAgeMs) && sum.summaryAgeMs >= 0
         ? `${Math.round(sum.summaryAgeMs / 1000)}s ago`
         : 'none yet';
-      return `summarizer: ${sum.enabled ? 'on' : 'off'} provider=${sum.provider ?? 'auto'} attached=${sum.attached ? 'yes' : 'no'} subagents=${sum.subagents ? 'yes' : 'no'} engine=${sum.running ? 'running' : 'idle'} ticks=${sum.ticks ?? 0}${sum.lastSkip ? ` skip=${sum.lastSkip}` : ''} started=${sum.starts ?? 0} errors=${sum.errors ?? 0}${sum.inFlight ? ' inFlight=1' : ''} summary=${sum.summaryChars ? `${sum.summaryChars}ch (${age})` : 'none yet'}${sum.lastError ? ` lastError=${String(sum.lastError).slice(0, 160)}` : ''}`;
+      const child = sum.child ? `${String(sum.child).slice(0, 8)}${sum.childSettled ? '(settled)' : ''}` : 'none';
+      return `summarizer: ${sum.enabled ? 'on' : 'off'} provider=${sum.provider ?? 'auto'} attached=${sum.attached ? 'yes' : 'no'} subagents=${sum.subagents ? 'yes' : 'no'} engine=${sum.running ? 'running' : 'idle'} child=${child}${sum.settlementGuarded ? ' guard=on' : ''} prompts=${sum.prompts ?? 0} trigger=${sum.lastTrigger ?? 'none'}${sum.awaiting ? ' awaiting=1' : ''} ticks=${sum.ticks ?? 0}${sum.lastSkip ? ` skip=${sum.lastSkip}` : ''} started=${sum.starts ?? 0} errors=${sum.errors ?? 0}${sum.inFlight ? ' inFlight=1' : ''} summary=${sum.summaryChars ? `${sum.summaryChars}ch (${age})` : 'none yet'}${sum.lastError ? ` lastError=${String(sum.lastError).slice(0, 160)}` : ''}`;
     })(),
     rt.overlay
       ? `floating window: ${rt.overlay.running ? 'on' : 'off'} endpoint=${rt.overlay.endpoint ?? 'n/a'}`
@@ -181,6 +182,48 @@ export function status(ctx, rt) {
     `config: ${rt.configPath}`,
   ].filter(Boolean);
   return { text: clip(lines.join('\n')) };
+}
+
+// On-demand summary (user m01656): nudge the persistent summarizer child and wait for
+// it to write a new note. Never touches the main conversation — this is a normal tool call.
+export async function summarize(ctx, rt, args = {}) {
+  const summarizer = rt.lifecycle?.summarizer ?? rt.summarizer ?? null;
+  if (!rt.engine) {
+    return { text: 'RTA is not running — call rta_start first; no background summarizer is active.' };
+  }
+  if (!summarizer || typeof summarizer.requestNow !== 'function') {
+    return { text: 'The background summarizer is not available in this build.' };
+  }
+  const waitMs = clampInt(args.waitMs, 0, 60_000, rt.config.inject?.summarizer?.demandWaitMs ?? 25_000);
+  let result = null;
+  try {
+    result = await summarizer.requestNow({ reason: String(args.reason ?? 'tool'), waitMs });
+  } catch (err) {
+    return { text: `RTA summarize failed: ${err?.message ?? err}` };
+  }
+  const st = summarizer.status?.() ?? {};
+  const trigger = result?.trigger ?? st.lastTrigger ?? 'unknown';
+  if (!result || result.ok === false) {
+    const age = Number.isFinite(st.summaryAgeMs) && st.summaryAgeMs >= 0
+      ? `latest summary is ${Math.round(st.summaryAgeMs / 1000)}s old`
+      : 'no summary has been written yet (the subagent may still be starting; try again in a few seconds)';
+    return {
+      text: [
+        'RTA summarize: no fresh summary arrived.',
+        `reason=${result?.reason ?? 'unknown'} trigger=${trigger} waitMs=${waitMs}`,
+        age,
+        st.lastError ? `lastError=${String(st.lastError).slice(0, 160)}` : null,
+        result?.summary ? `previous summary:\n${result.summary}` : null,
+      ].filter(Boolean).join('\n'),
+    };
+  }
+  return {
+    text: [
+      `RTA fresh summary (trigger=${trigger}, ${iso(result.summaryAt)}):`,
+      String(result.summary ?? '').trim(),
+      `session=${rt.engine.sessionId ?? '?'} (the main conversation was not woken by this).`,
+    ].join('\n'),
+  };
 }
 
 function kindLabel(ev) {
