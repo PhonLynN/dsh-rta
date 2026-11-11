@@ -726,7 +726,8 @@ window.__ModuleLoader__.load({
       const OVERLAY = typeof window !== 'undefined' && window.__RTA_OVERLAY__ === true;
       const nativeBridge = OVERLAY && typeof window !== 'undefined' ? window.__rtaOverlay : null;
       if (OVERLAY) root.classList.add('rta-overlay');
-      const liveBackdrop = OVERLAY ? startLiveBackdrop(root) : null;
+      // 采集背板已移除（设计难度与成本不值得）：浮窗只保留设计稿图层（透明 + 描边/高光/外阴影）。
+      const liveBackdrop = null;
 
       // 位置记忆（拖动后保存）；默认按设计稿在 1280 宽画布上的落点换算成右侧 100 / 顶部 88
       if (OVERLAY) {
