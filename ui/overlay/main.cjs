@@ -3,7 +3,7 @@
  *
  * 路线（用户拍板，2026-11）：**透明置顶窗 + 渲染层采集背板 + 设计稿图层原样**。
  *  - 窗口：透明置顶、不使用任何系统材质（不用 DWM Acrylic/Mica，不加 tint/系统圆角）；
- *  - 模糊：渲染层采集 getDisplayMedia 抓前台窗口 → canvas 预模糊（CSS blur(20px)）→ 设计稿图层叠加。
+ *  - 模糊：不做模糊、不做采集；卡片用纯色半透明底（rgba(20,20,22,0.55)）保证文字可读。
  *  - 设计稿图层：渐变/描边/squircle/阴影全部按 pen 导出原值，不做任何近似或补偿层。
  *  - 自反馈：默认不开内容保护（远程桌面本身也是抓屏，开了用户就看不到浮窗）；
  *    需要时可用 DSH_RTA_OVERLAY_CP=1 打开 setContentProtection 做本机调试。
@@ -13,7 +13,7 @@
  *    卡外空白/缝隙点击穿透。
  */
 
-const { app, BrowserWindow, screen, session, desktopCapturer, ipcMain } = require('electron');
+const { app, BrowserWindow, screen, ipcMain } = require('electron');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -42,76 +42,6 @@ function killStaleWindows() {
     log('stale overlay instances cleared');
   } catch (err) {
     log('stale overlay cleanup skipped', String((err && err.status) || ''));
-  }
-}
-
-// ---- 前台窗口信息（渲染层窗口捕获背板需要）----
-// 正常路径：插件 host 的 /api/dsh-rta/state 里带 foreground.rect（engine 每秒采集）。
-// 兜底路径：host 还是旧版（没重启）时 state 里没有 rect，这里直接用 Win32 查，
-// 免得「必须重启 DSH 才能用」。koffi 是 DSH 桌面版自带依赖（app.asar.unpacked），
-// 浮窗是独立 Electron 进程，按绝对路径加载；加载失败就返回 null，渲染层回落整屏模式。
-let win32api = null;
-function loadWin32() {
-  if (win32api !== null) return win32api;
-  const candidates = [];
-  if (process.env.DSH_KOFFI_PATH) candidates.push(process.env.DSH_KOFFI_PATH);
-  if (process.env.LOCALAPPDATA) {
-    candidates.push(path.join(process.env.LOCALAPPDATA, 'Programs', 'DeepSeek Harness', 'resources',
-      'app.asar.unpacked', 'dsh', 'node_modules', 'koffi', 'index.cjs'));
-  }
-  if (process.resourcesPath) {
-    candidates.push(path.join(process.resourcesPath, 'app.asar.unpacked', 'dsh', 'node_modules', 'koffi', 'index.cjs'));
-  }
-  const errors = [];
-  let koffi = null;
-  for (const file of candidates) {
-    try {
-      if (!fs.existsSync(file)) { errors.push('missing ' + file); continue; }
-      koffi = require(file);
-      break;
-    } catch (err) {
-      errors.push(String(err && err.message ? err.message : err));
-    }
-  }
-  if (!koffi) {
-    log('win32 ffi unavailable', errors.join(' | '));
-    win32api = false;
-    return win32api;
-  }
-  try {
-    const user32 = koffi.load('user32.dll');
-    const RECT = koffi.struct('RECT', { left: 'int32', top: 'int32', right: 'int32', bottom: 'int32' });
-    win32api = {
-      GetForegroundWindow: user32.func('void* GetForegroundWindow()'),
-      GetWindowRect: user32.func('bool GetWindowRect(void* hWnd, _Out_ RECT* lpRect)'),
-      GetWindowTextW: user32.func('int GetWindowTextW(void* hWnd, _Out_ uint16_t* lpString, int nMaxCount)'),
-    };
-    log('win32 ffi ready');
-  } catch (err) {
-    log('win32 ffi failed', String(err && err.stack ? err.stack : err));
-    win32api = false;
-  }
-  return win32api;
-}
-
-function foregroundWindowInfo() {
-  const api = loadWin32();
-  if (!api) return null;
-  try {
-    const hwnd = api.GetForegroundWindow();
-    if (!hwnd) return null;
-    const rect = { left: 0, top: 0, right: 0, bottom: 0 };
-    if (!api.GetWindowRect(hwnd, rect)) return null;
-    const width = rect.right - rect.left;
-    const height = rect.bottom - rect.top;
-    if (!(width > 0) || !(height > 0)) return null;
-    const buf = new Uint16Array(512);
-    const n = api.GetWindowTextW(hwnd, buf, 512);
-    const title = n > 0 ? Buffer.from(buf.buffer, 0, n * 2).toString('utf16le') : '';
-    return { title, rect: { x: rect.left, y: rect.top, width, height }, hwnd: String(hwnd) };
-  } catch (err) {
-    log('foreground window failed', String(err && err.message ? err.message : err));
-    return null;
   }
 }
 
@@ -145,35 +75,9 @@ let expandedBounds = null;
 // 抓屏时把本窗口排除掉，否则玻璃会采样到自己形成反馈。
 // 默认关闭：远程桌面（RDP）本质是屏幕捕获，WDA_EXCLUDEFROMCAPTURE 的窗口
 // 会被排除在远程画面之外 = 用户完全看不到这个浮窗（本机实测品红对照窗不可见）。
-// 自反馈改由渲染层「遮掉卡片区域」解决（见 src/client.js maskSelf）。
+// 现状：不再抓屏；卡片用纯色半透明底（见 src/client.js 的 .rta-glass）。
 // 只有纯本机、且愿意接受「截图/录屏里看不到浮窗」时才用 DSH_RTA_OVERLAY_CP=1 打开。
 const CONTENT_PROTECTION = process.env.DSH_RTA_OVERLAY_CP === '1';
-
-async function pickCaptureSource(display) {
-  const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 0, height: 0 } });
-  return sources.find((s) => String(s.display_id) === String(display.id)) || sources[0] || null;
-}
-
-// 渲染层需要的全部对齐信息：窗口在屏幕上的位置 + 所在显示器 + 两张卡在窗口内的矩形。
-function overlayGeometry() {
-  const bounds = win && !win.isDestroyed()
-    ? win.getBounds()
-    : { x: 0, y: 0, width: WIN_WIDTH, height: WIN_HEIGHT };
-  const display = displayFor(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
-  return {
-    window: bounds,
-    display: { id: display.id, bounds: display.bounds, workArea: display.workArea, scaleFactor: display.scaleFactor },
-    cards: [
-      { kind: 'messages', x: PAD, y: PAD, width: CARD_MESSAGES.width, height: CARD_MESSAGES.height, radius: 54 },
-      { kind: 'composer', x: PAD, y: PAD + CARD_MESSAGES.height + CARD_GAP, width: CARD_COMPOSER.width, height: CARD_COMPOSER.height, radius: 40 },
-    ],
-  };
-}
-
-function sendGeometry() {
-  if (!win || win.isDestroyed()) return;
-  try { win.webContents.send('rta:overlay-geometry', overlayGeometry()); } catch { /* 渲染层还没就绪 */ }
-}
 
 let win = null;
 let pollTimer = null;
@@ -260,7 +164,6 @@ function setCollapsed(next) {
   } catch (err) {
     log('collapse failed', String(err && err.message ? err.message : err));
   }
-  sendGeometry();
 
   log('collapsed', collapsed);
 }
@@ -395,7 +298,6 @@ function createWindow() {
 
   win.webContents.on('did-finish-load', () => {
     log('window loaded');
-    sendGeometry();
   });
   win.webContents.on('did-fail-load', (_e, code, desc) => log('window load failed', code, desc));
   win.webContents.on('console-message', (_e, level, message, line, sourceId) => {
@@ -416,10 +318,8 @@ function createWindow() {
   // header 拖动窗口时，页面要保证非卡区域不拦截拖动（client.js 设置 app-region）。
   win.on('move', () => {
     ignoringMouse = null;
-    sendGeometry();
   });
   win.on('resize', () => {
-    sendGeometry();
   });
 }
 
@@ -440,52 +340,11 @@ function startPolling() {
 app.on('second-instance', () => setVisible(true));
 
 // 渲染层拿对齐信息（窗口位置 + 显示器 + 卡片矩形）。
-ipcMain.handle('rta:overlay-geometry', () => overlayGeometry());
-
 app.whenReady().then(async () => {
   if (!HAS_SINGLE_INSTANCE_LOCK) { app.quit(); return; }
   log('ready');
 
-  // 渲染层调用 getDisplayMedia 时，这里替它选「窗口当前所在的那块屏」。
-  // 必须传真实的 DesktopCapturerSource（传 {id: display.id} 会 NotReadableError）。
-  try {
-    session.defaultSession.setDisplayMediaRequestHandler(async (_request, callback) => {
-      try {
-        const bounds = win && !win.isDestroyed()
-          ? win.getBounds()
-          : { x: 0, y: 0, width: WIN_WIDTH, height: WIN_HEIGHT };
-        const display = displayFor(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
-        const source = await pickCaptureSource(display);
-        log('displayMedia request', 'display=' + display.id, 'source=' + (source ? source.id : 'none'));
-        if (!source) throw new Error('no screen source');
-        callback({ video: source });
-      } catch (err) {
-        log('displayMedia failed', err && err.message ? err.message : String(err));
-        callback({});
-      }
-    }, { useSystemPicker: false });
-    log('displayMedia handler ready');
-  } catch (err) {
-    log('displayMedia handler failed', String(err));
-  }
-
   killStaleWindows();
-  // 渲染层的玻璃背板：优先抓「前台窗口」的窗口流（窗口捕获不含置顶浮窗自己，
-  // 没有自反馈、也不需要 setContentProtection，远程桌面照样可见）。
-  ipcMain.handle('rta:window-sources', async () => {
-    try {
-      const sources = await desktopCapturer.getSources({
-        types: ['window'],
-        thumbnailSize: { width: 0, height: 0 },
-      });
-      return sources.map((s) => ({ id: s.id, name: s.name }));
-    } catch (err) {
-      log('window sources failed', String(err));
-      return [];
-    }
-  });
-  // 前台窗口几何：state 里没有 foreground.rect（旧版 host）时渲染层用这个兜底。
-  ipcMain.handle('rta:foreground-window', () => foregroundWindowInfo());
   // 收起/展开：渲染层点 − 时调用，主进程把窗口缩成胶囊 / 恢复原尺寸。
   ipcMain.handle('rta:set-collapsed', (_event, next) => {
     setCollapsed(next === true);
@@ -493,13 +352,9 @@ app.whenReady().then(async () => {
   });
   try {
     createWindow();
-    // 页面加载后由渲染层自己启动采集背板（getDisplayMedia → canvas 预模糊）。
     loadOverlayPage();
     startHitTest();
     startPolling();
-    screen.on('display-metrics-changed', () => { sendGeometry(); });
-    screen.on('display-added', () => { sendGeometry(); });
-    screen.on('display-removed', () => { sendGeometry(); });
   } catch (err) {
     log('createWindow failed', err && err.stack ? err.stack : String(err));
     app.quit();
