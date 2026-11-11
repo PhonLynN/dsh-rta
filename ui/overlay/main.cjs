@@ -1,11 +1,13 @@
 /**
  * ui/overlay/main.cjs — RTA 全局浮窗的 Electron 宿主。
  *
- * 路线（用户拍板，2026-11）：**采集渲染方案**。
- *  - 窗口：透明置顶、不使用任何系统材质；
- *  - 玻璃：渲染层用 getDisplayMedia 捕获桌面 → 只取两张卡正后方的区域 →
- *    按设计稿 `blur(20px)` 预模糊后画进 canvas → 设计稿图层（渐变/描边/squircle/
- *    阴影）原样叠在上面。桌面在卡片区域之外仍然清晰透出。
+ * 路线（用户拍板，2026-11）：**透明置顶窗 + 设计稿图层原样，模糊由独立后端提供**。
+ *  - 窗口：透明置顶、不使用任何系统材质（不用 DWM Acrylic/Mica，不加 tint/系统圆角）；
+ *  - 模糊后端（两选一）：
+ *    a) 液态玻璃面板 `@hicccc77/electron-liquid-glass`：D3D11/DXGI-DDA 面板垫在窗口下面，
+ *       真实采样桌面并做 blur；窗口只画设计稿图层。默认走这条；
+ *    b) 渲染层采集（回退）：getDisplayMedia 抓前台窗口 → canvas 预模糊 → 设计稿图层叠加。
+ *  - 设计稿图层：渐变/描边/squircle/阴影全部按 pen 导出原值，不做任何近似或补偿层。
  *  - 自反馈：窗口开 `setContentProtection(true)`（WDA_EXCLUDEFROMCAPTURE），
  *    抓屏里本窗口被挖掉、只留它背后的真实画面，否则会把自己的玻璃再糊一遍。
  *    代价：用户的截图/录屏里也看不到这个浮窗（DSH_RTA_OVERLAY_CP=0 可关闭，仅调试用）。
@@ -151,6 +153,102 @@ let expandedBounds = null;
 // 只有纯本机、且愿意接受「截图/录屏里看不到浮窗」时才用 DSH_RTA_OVERLAY_CP=1 打开。
 const CONTENT_PROTECTION = process.env.DSH_RTA_OVERLAY_CP === '1';
 
+// ---- 液态玻璃面板（首选模糊后端：@hicccc77/electron-liquid-glass）----
+// 独立窗口里的 CSS backdrop-filter 采不到桌面像素；系统材质又会强加 tint/系统圆角。
+// 这个库用 DXGI Desktop Duplication 采集 + D3D11 shader 模糊 + DirectComposition，
+// 把「真实模糊」面板垫在窗口下面（anchorWindow=本窗口，z 序自动贴着窗口下沿），
+// 窗口本身只画设计稿图层（渐变 #FFFFFF12→#FFFFFF08、描边 #ffffff1f、squircle、阴影）。
+// 注意：DDA 在远程桌面/虚拟显示器下可能只能拿到黑帧（本机实测），此时用
+// RTA_GLASS=0 关掉，回退到渲染层采集方案（src/client.js startLiveBackdrop）。
+const GLASS_ENABLED = process.env.RTA_GLASS !== '0';
+const GLASS_SIGMA = Number(process.env.RTA_GLASS_SIGMA || 20); // 设计稿 blur(20px)
+const GLASS_POLICY = process.env.RTA_GLASS_POLICY || 'dda-only'; // all | dda-only | none
+let liquidGlass = null;
+let glassPanel = null; // 只有消息卡有背景模糊（composer 设计稿是纯色 #2c2c2e）
+
+function loadLiquidGlass() {
+  if (!GLASS_ENABLED) { log('liquid glass disabled'); return null; }
+  const candidates = [];
+  if (process.env.RTA_LIQUID_GLASS) candidates.push(process.env.RTA_LIQUID_GLASS);
+  candidates.push(path.join(__dirname, 'node_modules', '@hicccc77', 'electron-liquid-glass'));
+  candidates.push(path.join(os.homedir(), '.dsh', 'rta', 'glass-runtime', 'node_modules', '@hicccc77', 'electron-liquid-glass'));
+  const errors = [];
+  for (const dir of candidates) {
+    try {
+      if (!fs.existsSync(path.join(dir, 'package.json'))) { errors.push('missing ' + dir); continue; }
+      const mod = require(dir);
+      if (!mod || typeof mod.isSupported !== 'function') { errors.push('bad exports ' + dir); continue; }
+      if (!mod.isSupported()) { errors.push('unsupported ' + dir); continue; }
+      log('liquid glass ready', dir);
+      return mod;
+    } catch (err) {
+      errors.push(String(err && err.message ? err.message : err));
+    }
+  }
+  log('liquid glass unavailable', errors.join(' | '));
+  return null;
+}
+
+// 面板坐标是屏幕坐标（DIP）：消息卡在窗口内的 (PAD, PAD)，尺寸 420×520。
+function glassPanelRect() {
+  const bounds = win.getBounds();
+  return {
+    x: bounds.x + PAD,
+    y: bounds.y + PAD,
+    width: CARD_MESSAGES.width,
+    height: CARD_MESSAGES.height,
+  };
+}
+
+// 跟着窗口移动；窗口隐藏/收起成胶囊时把面板一起收起（胶囊不透明，不需要模糊）。
+function syncGlassPanel() {
+  if (!glassPanel || !win || win.isDestroyed()) return;
+  try {
+    if (collapsed || !win.isVisible()) {
+      if (glassPanel.visible !== false) { glassPanel.hide(80); glassPanel.visible = false; }
+      return;
+    }
+    glassPanel.setBounds(glassPanelRect());
+    if (glassPanel.visible === false) glassPanel.show(120);
+    glassPanel.visible = true;
+  } catch (err) {
+    log('glass panel sync failed', String(err && err.message ? err.message : err));
+  }
+}
+
+function createGlassPanel() {
+  liquidGlass = loadLiquidGlass();
+  if (!liquidGlass || !win) return false;
+  try {
+    const rect = glassPanelRect();
+    const display = displayFor(rect.x + rect.width / 2, rect.y + rect.height / 2);
+    glassPanel = liquidGlass.createPanel({
+      ...rect,
+      cornerRadius: 54, // 设计稿 squircle 的端点半径（连续曲线，后续 shader 再精修）
+      blurSigma: GLASS_SIGMA,
+      saturation: 1, // 不做色彩增强：颜色由设计稿渐变决定
+      displacementScale: 0, // 不要透镜/折射
+      aberrationIntensity: 0, // 不要色散
+      dpr: display.scaleFactor,
+      capturePolicy: GLASS_POLICY,
+      anchorWindow: win,
+    });
+    glassPanel.visible = true;
+    log('glass panel created', 'id=' + glassPanel.id, 'sigma=' + GLASS_SIGMA, 'policy=' + GLASS_POLICY, 'dpr=' + display.scaleFactor);
+    syncGlassPanel();
+    return true;
+  } catch (err) {
+    log('glass panel failed', err && err.stack ? err.stack : String(err));
+    glassPanel = null;
+    return false;
+  }
+}
+
+function destroyGlassPanel() {
+  try { if (glassPanel) glassPanel.destroy(); } catch { /* ignore */ }
+  glassPanel = null;
+}
+
 async function pickCaptureSource(display) {
   const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 0, height: 0 } });
   return sources.find((s) => String(s.display_id) === String(display.id)) || sources[0] || null;
@@ -263,6 +361,7 @@ function setCollapsed(next) {
     log('collapse failed', String(err && err.message ? err.message : err));
   }
   sendGeometry();
+  syncGlassPanel();
   log('collapsed', collapsed);
 }
 
@@ -297,6 +396,7 @@ function setVisible(next, why) {
     log(`visible ${next === true}`, why ? `why=${why}` : '');
   }
   try { win.webContents.send('rta:overlay-visible', next === true); } catch { /* ignore */ }
+  syncGlassPanel();
 }
 
 async function tick() {
@@ -393,10 +493,6 @@ function createWindow() {
     }
   }
 
-  const query = {};
-  if (ENDPOINT) query.endpoint = ENDPOINT;
-  if (TOKEN) query.token = TOKEN;
-
   win.webContents.on('did-finish-load', () => {
     log('window loaded');
     sendGeometry();
@@ -421,9 +517,20 @@ function createWindow() {
   win.on('move', () => {
     ignoringMouse = null;
     sendGeometry();
+    syncGlassPanel();
   });
-  win.on('resize', sendGeometry);
+  win.on('resize', () => {
+    sendGeometry();
+    syncGlassPanel();
+  });
+}
 
+// 面板模式决定后才知道要不要让渲染层跳过自己的采集背板，所以页面在这里才加载。
+function loadOverlayPage() {
+  const query = {};
+  if (ENDPOINT) query.endpoint = ENDPOINT;
+  if (TOKEN) query.token = TOKEN;
+  if (glassPanel) query.glass = '1';
   void win.loadFile(path.join(__dirname, 'window.html'), { query });
 }
 
@@ -489,11 +596,14 @@ app.whenReady().then(() => {
   });
   try {
     createWindow();
+    // 先确定模糊后端，再加载页面（页面据此决定是否启用渲染层采集背板）。
+    createGlassPanel();
+    loadOverlayPage();
     startHitTest();
     startPolling();
-    screen.on('display-metrics-changed', sendGeometry);
-    screen.on('display-added', sendGeometry);
-    screen.on('display-removed', sendGeometry);
+    screen.on('display-metrics-changed', () => { sendGeometry(); syncGlassPanel(); });
+    screen.on('display-added', () => { sendGeometry(); syncGlassPanel(); });
+    screen.on('display-removed', () => { sendGeometry(); syncGlassPanel(); });
   } catch (err) {
     log('createWindow failed', err && err.stack ? err.stack : String(err));
     app.quit();
@@ -503,6 +613,7 @@ app.whenReady().then(() => {
 app.on('window-all-closed', () => { log('window-all-closed'); app.quit(); });
 app.on('before-quit', () => {
   log('before-quit');
+  destroyGlassPanel();
   if (pollTimer) clearInterval(pollTimer);
   if (hitTimer) clearInterval(hitTimer);
   if (saveTimer) clearTimeout(saveTimer);

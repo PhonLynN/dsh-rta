@@ -28,6 +28,9 @@
     window.__RTA_OVERLAY__ = true; // 让 client.js 走 overlay 布局（卡片定位在 20/20 与 20/554）
     const params0 = new URLSearchParams(location.search);
     window.__RTA_CARD__ = params0.get('card') || null;
+    // '1' = 模糊由主进程的液态玻璃面板（@hicccc77/electron-liquid-glass）提供，
+    // 渲染层不要再启动自己的采集背板（见 src/client.js 的 GLASS_PANEL）。
+    window.__RTA_GLASS__ = params0.get('glass') === '1';
     // 复用给 DSH 页面写的客户端 bundle：这里只需要它的工厂函数，不需要宿主 ModuleLoader。
     window.__ModuleLoader__ = {
       entries: {},
