@@ -47,7 +47,7 @@ window.__ModuleLoader__.load({
 #${ROOT_ID} *{box-sizing:border-box}
 #${ROOT_ID} .rta-win{position:fixed;width:420px;pointer-events:auto;display:flex;flex-direction:column;gap:14px}
 #${ROOT_ID} .rta-card{position:relative;width:420px;filter:drop-shadow(0px 6px 20px rgba(0,0,0,0.302))}
-#${ROOT_ID} .rta-glass{position:absolute;inset:0;clip-path:path("${PATH_MESSAGES}");backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);background:linear-gradient(170deg,#FFFFFF12 0%,#FFFFFF08 100%);box-shadow:inset 0px 1px 0px #ffffff12}
+#${ROOT_ID} .rta-glass{position:absolute;inset:0;clip-path:path("${PATH_MESSAGES}");backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);background:transparent;box-shadow:inset 0px 1px 0px #ffffff12}
 #${ROOT_ID} .rta-card--messages{height:520px}
 #${ROOT_ID} .rta-card--composer{height:98px;filter:drop-shadow(0px 4px 16px rgba(0,0,0,0.302))}
 #${ROOT_ID} .rta-card--composer .rta-glass{clip-path:path("${PATH_COMPOSER}");backdrop-filter:none;-webkit-backdrop-filter:none;background:#2c2c2e;box-shadow:none}
