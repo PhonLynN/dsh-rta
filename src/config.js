@@ -62,6 +62,7 @@ export const DEFAULT_RTA_CONFIG = Object.freeze({
       montageFrames: 8,       // 多页拼图最多几格（超过则取最近 8 页）
       montageMaxTokens: 700,  // 多页拼图 token 预算
       montageMaxAgeMs: 120_000, // 只统计最近 2 分钟内经过的页面（判「连续切换」而非「翻旧账」）
+      montageVisualDist: 0.12, // 同窗口内画面差异超过这个值（缩略图平均绝对差 0–1）视为换页
       hd: true,               // 优先从原生录像抽 HD 帧（裁窗+缩图），失败才回落拼图
       hdMaxWidth: 1600,       // HD 帧最大宽度（约 ≤900 tokens）
     },

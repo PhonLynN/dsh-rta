@@ -144,3 +144,164 @@ export function lumaGain(meanV, { refV = 160, gainMax = 3, vFloor = 40 } = {}) {
   const g = refV / Math.max(vFloor, meanV);
   return g < 1 ? 1 : g > gainMax ? gainMax : g;
 }
+
+/* ------------------------------------------------------------------ *
+ * 结构特征：把「页面切换」和「视频/滚动运动」「局部文字变化」分开。
+ *
+ * scorePair/mc 只看像素差，视频播放和滚动同样会让它们升高。真实页面的切换
+ * 往往同时改变整块版面（分块差占比高）和全局颜色分布（HSV 直方图距离大），
+ * 而视频运动/滚动更像「整幅平移 + 局部像素动」，两者可以用分块差 + 直方图
+ * 距离 + 行位移估计组合区分。这些函数全部在 192×108 哨兵帧上运行，成本
+ * 约 0.1–0.3 ms/帧。
+ * ------------------------------------------------------------------ */
+
+/** 32 段色相（按饱和度加权）+ 8 段亮度直方图，返回 Float32Array(40)。 */
+export function hueHistogram(hsv, pixels, out) {
+  const dst = out ?? new Float32Array(40);
+  dst.fill(0);
+  for (let i = 0; i < pixels; i++) {
+    const o = i * 3;
+    const h = hsv[o];
+    const s = hsv[o + 1];
+    const v = hsv[o + 2];
+    const hi = ((h / 255) * 32) | 0;
+    const vi = ((v / 255) * 8) | 0;
+    const w = s / 255;
+    dst[hi < 0 ? 0 : hi > 31 ? 31 : hi] += w; // 色相（低饱和衰减）
+    dst[32 + (vi < 0 ? 0 : vi > 7 ? 7 : vi)] += 1 - w * 0.5; // 亮度
+  }
+  return dst;
+}
+
+/** 归一化直方图 L1 距离（0–1）。结构/配色整体变化 → 接近 1。 */
+export function histL1(a, b) {
+  let sum = 0;
+  let total = 0;
+  for (let i = 0; i < a.length; i++) {
+    const d = a[i] - b[i];
+    sum += d < 0 ? -d : d;
+    total += a[i] + b[i];
+  }
+  return total > 0 ? sum / total : 0;
+}
+
+/**
+ * 分块差占比：把画面切成 block×block 的块，块内平均 RGB 差超过 thr 的比例。
+ * 页面切换（整版重排）通常 >0.3；单调滚动/小区域视频运动通常 <0.25。
+ * @param {Uint8Array|Buffer} prev RGB
+ * @param {Uint8Array|Buffer} cur RGB
+ */
+export function blockDiffFrac(prev, cur, width, height, opts = {}) {
+  const block = opts.block ?? 8;
+  const thr = opts.thr ?? 30;
+  const bw = Math.ceil(width / block);
+  const bh = Math.ceil(height / block);
+  let changed = 0;
+  let count = 0;
+  for (let by = 0; by < bh; by++) {
+    const y0 = by * block;
+    const y1 = Math.min(height, y0 + block);
+    for (let bx = 0; bx < bw; bx++) {
+      const x0 = bx * block;
+      const x1 = Math.min(width, x0 + block);
+      let sr = 0;
+      let sg = 0;
+      let sb = 0;
+      let n = 0;
+      for (let y = y0; y < y1; y++) {
+        for (let x = x0; x < x1; x++) {
+          const p = (y * width + x) * 3;
+          sr += Math.abs(prev[p] - cur[p]);
+          sg += Math.abs(prev[p + 1] - cur[p + 1]);
+          sb += Math.abs(prev[p + 2] - cur[p + 2]);
+          n++;
+        }
+      }
+      count++;
+      if (n && (sr + sg + sb) / (n * 3) > thr) changed++;
+    }
+  }
+  return count ? changed / count : 0;
+}
+
+/**
+ * 整帧像素变化占比（不做运动补偿）。视频/大面积动画会显著升高。
+ * @returns {number} 0–1
+ */
+export function pixelChangeFrac(prev, cur, width, height, tau = 30, max = 1) {
+  const pixels = width * height;
+  let changed = 0;
+  // early exit：超过 max 直接返回（只看「高不高」）
+  const cap = Math.max(1, Math.floor(pixels * max));
+  for (let i = 0, p = 0; i < pixels; i++, p += 3) {
+    const d = Math.abs(prev[p] - cur[p]) + Math.abs(prev[p + 1] - cur[p + 1]) + Math.abs(prev[p + 2] - cur[p + 2]);
+    if (d > tau) {
+      changed++;
+      if (changed >= cap) return changed / pixels;
+    }
+  }
+  return changed / pixels;
+}
+
+/** 每行平均亮度（行数长度的 Float32Array）。 */
+export function rowMeanProfile(rgb, width, height, out) {
+  const dst = out ?? new Float32Array(height);
+  for (let y = 0; y < height; y++) {
+    let sum = 0;
+    let p = y * width * 3;
+    for (let x = 0; x < width; x++, p += 3) sum += 0.299 * rgb[p] + 0.587 * rgb[p + 1] + 0.114 * rgb[p + 2];
+    dst[y] = width ? sum / width : 0;
+  }
+  return dst;
+}
+
+/**
+ * 行位移估计（垂直滚动/翻页）：在 ±maxShift 内找行亮度剖面的最佳对齐，
+ * 返回 {shift, corr, residRatio}。
+ *  - corr 是重叠区 Pearson 相关：滚动时接近 1，换页/内容重排时低；
+ *  - residRatio = 对齐后残差 / 未对齐残差：滚动应 ≤0.6，切页接近 1。
+ * @param {Float32Array} a prev 行剖面
+ * @param {Float32Array} b cur 行剖面
+ */
+export function estimateRowShift(a, b, opts = {}) {
+  const maxShift = opts.maxShift ?? 24;
+  const h = Math.min(a.length, b.length);
+  let best = { shift: 0, corr: 0, residRatio: 1 };
+  let baseAbs = 0;
+  {
+    let s = 0;
+    for (let y = 0; y < h; y++) s += Math.abs(a[y] - b[y]);
+    baseAbs = h ? s / h : 0;
+  }
+  for (let shift = -maxShift; shift <= maxShift; shift++) {
+    const y0 = Math.max(0, -shift);
+    const y1 = Math.min(h, h - shift);
+    const n = y1 - y0;
+    if (n < h * 0.5) continue;
+    let ma = 0;
+    let mb = 0;
+    for (let y = y0; y < y1; y++) {
+      ma += a[y];
+      mb += b[y + shift];
+    }
+    ma /= n;
+    mb /= n;
+    let cov = 0;
+    let va = 0;
+    let vb = 0;
+    let abs = 0;
+    for (let y = y0; y < y1; y++) {
+      const da = a[y] - ma;
+      const db = b[y + shift] - mb;
+      cov += da * db;
+      va += da * da;
+      vb += db * db;
+      abs += Math.abs(a[y] - b[y + shift]);
+    }
+    const corr = va > 1e-6 && vb > 1e-6 ? cov / Math.sqrt(va * vb) : 0;
+    const resid = abs / n;
+    if (corr > best.corr) best = { shift, corr, residRatio: baseAbs > 1e-6 ? resid / baseAbs : 1 };
+  }
+  return best;
+}
+

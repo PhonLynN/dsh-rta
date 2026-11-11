@@ -21,6 +21,22 @@ export const DEFAULT_SELECT = Object.freeze({
   cutZ: 3,             // 相对自身基线要显著
   cutMc: 0.2,          // 运动补偿后变化占比 >20% 才当切镜（整窗平移会被压到很低）
   cutGapMs: 400,       // 两次 cut 至少隔 400ms（storyboard 同值）
+  // 结构闸门：只有「版面/配色整体变化」才算切镜，滚动和视频运动不算。
+  cutBFrac: 0.40,      // 分块差占比 ≥40%（块均值差 >30）
+  cutHist: 0.20,       // HSV 直方图 L1 ≥20%
+  // 滚动判定：行位移可解释 + 补偿后残差低
+  scrollShift: 6,      // 行位移 ≥6px
+  scrollCorr: 0.55,    // 行亮度剖面相关 ≥0.55
+  scrollResid: 0.60,   // 对齐后残差 / 原始残差 ≤0.60
+  // 运动判定（视频/动画/拖拽）：需求里「切镜 vs 视频运动」的关键
+  motionMc: 0.10,
+  motionPix: 0.05,
+  // 播放模式退避：最近 1s 内大部分帧都在动 → 提高 cut 门槛（视频播放时）
+  backoffFrames: 15,
+  backoffMotionCount: 8,
+  backoffCutBFrac: 0.60,
+  backoffCutHist: 0.35,
+  backoffCutMc: 0.45,
   integralNeed: 360,   // 累积变化阈值（约 4×30fps×3s，按 score 尺度缩放）
   integralMin: 2,      // 单帧至少贡献 2 才计入累积（过滤噪声）
   textGapMs: 250,      // 文字变化触发的冷却
@@ -50,6 +66,7 @@ export function createSelector(opts = {}) {
   let integral = 0;
   let textPending = false;
   let lastScore = 0;
+  const motionAt = []; // 最近 1s 内判为运动/滚动的 tick 时间（播放模式退避用）
 
   const prune = (t) => {
     while (recent.length && t - recent[0] > 60_000) recent.shift();
@@ -73,7 +90,9 @@ export function createSelector(opts = {}) {
 
     /**
      * 每帧调用一次。
-     * @param {{t: number, score: number, mc: number, meanV: number}} sample
+     * @param {{t: number, score: number, mc: number, meanV: number,
+     *   histL1?: number, bFrac30?: number, bFrac15?: number, pixFrac30?: number,
+     *   shiftPx?: number, shiftCorr?: number, scrollResid?: number}} sample
      * @returns {null | {kind: string, at: number, score: number, norm: number, z: number, mc: number, gain: number}}
      */
     ingest(sample) {
@@ -84,6 +103,24 @@ export function createSelector(opts = {}) {
       const norm = (sample.score ?? 0) * gain;
       const mc = sample.mc ?? 0;
       lastScore = norm;
+
+      // 结构特征（旧调用方不带这些字段时退化为原来的行为）
+      const hasStruct = Number.isFinite(sample.bFrac30) && Number.isFinite(sample.histL1);
+      const bFrac30 = hasStruct ? sample.bFrac30 : 0;
+      const histDiff = hasStruct ? sample.histL1 : 0;
+      const shiftPx = Number.isFinite(sample.shiftPx) ? sample.shiftPx : 0;
+      const shiftCorr = Number.isFinite(sample.shiftCorr) ? sample.shiftCorr : 0;
+      const scrollResid = Number.isFinite(sample.scrollResid) ? sample.scrollResid : 1;
+      const pixFrac = Number.isFinite(sample.pixFrac30) ? sample.pixFrac30 : 0;
+      const structural = !hasStruct || bFrac30 >= cfg.cutBFrac || histDiff >= cfg.cutHist;
+      // 滚动：位移可解释且补偿后残差低 → 不是切镜
+      const scrollLike = hasStruct && shiftPx >= cfg.scrollShift && shiftCorr >= cfg.scrollCorr && scrollResid <= cfg.scrollResid;
+      // 运动（视频/动画/拖拽）：变化占比高但不是整版重排
+      const motionLike = hasStruct && !scrollLike && (mc >= cfg.motionMc || pixFrac >= cfg.motionPix);
+      if (motionLike || scrollLike) motionAt.push(t);
+      while (motionAt.length && t - motionAt[0] > 1000) motionAt.shift();
+      // 播放模式：最近 1s 内大部分帧都在动（视频在播），cut 门槛要抬高
+      const playback = hasStruct && motionAt.length >= cfg.backoffMotionCount;
 
       stats.push(norm);
       const z = stats.z(norm);
@@ -103,13 +140,20 @@ export function createSelector(opts = {}) {
         return emit(TRIGGER.TEXT);
       }
 
-      // 2) 切镜：分数显著高于绝对阈值和自身基线，且不是整窗平移
+      // 2) 切镜：分数显著高于绝对阈值和自身基线，且是「版面/配色整体变化」而不是滚动/视频运动
       if (norm >= threshold && z >= cfg.cutZ && mc >= cfg.cutMc && t - lastCutAt >= cfg.cutGapMs) {
-        if (rateLimited) return null;
-        lastCutAt = t;
-        if (!lastSelectAt || t - lastSelectAt >= cfg.minSelectGapMs) {
-          accept(t);
-          return emit(TRIGGER.CUT);
+        const needBFrac = playback ? cfg.backoffCutBFrac : cfg.cutBFrac;
+        const needHist = playback ? cfg.backoffCutHist : cfg.cutHist;
+        const needMc = playback ? cfg.backoffCutMc : cfg.cutMc;
+        const strongStructural = bFrac30 >= needBFrac && histDiff >= needHist;
+        const cutOk = !hasStruct || (structural && !scrollLike && mc >= needMc && (!playback || strongStructural));
+        if (cutOk) {
+          if (rateLimited) return null;
+          lastCutAt = t;
+          if (!lastSelectAt || t - lastSelectAt >= cfg.minSelectGapMs) {
+            accept(t);
+            return emit(TRIGGER.CUT);
+          }
         }
       }
 
@@ -148,6 +192,8 @@ export function createSelector(opts = {}) {
         integral,
         lastSelectAt,
         recentCount: recent.length,
+        motionCount1s: motionAt.length,
+        playback: motionAt.length >= cfg.backoffMotionCount,
       };
     },
 

@@ -357,8 +357,9 @@ export function createLiveLifecycle({ rt, logger = rt?.logger } = {}) {
     const maxTokens = Number(imageConfig.montageMaxTokens) > 0 ? imageConfig.montageMaxTokens : 700;
     const maxAgeMs = Number(imageConfig.montageMaxAgeMs) > 0 ? imageConfig.montageMaxAgeMs : 120_000;
     const minPages = Number(imageConfig.montageMinPages) >= 3 ? Number(imageConfig.montageMinPages) : 3;
+    const visualDist = Number(imageConfig.montageVisualDist) > 0 ? imageConfig.montageVisualDist : 0.12;
     try {
-      return engine.composePages({ count: maxFrames, maxTokens, maxAgeMs, minPages, now: at });
+      return engine.composePages({ count: maxFrames, maxTokens, maxAgeMs, minPages, visualDist, now: at });
     } catch (err) {
       noteError('montage', err);
       return null;

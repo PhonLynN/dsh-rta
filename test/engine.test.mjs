@@ -279,3 +279,43 @@ test('engine: composePages 按页面归并、每页只留最后一帧；不足 m
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('composePages: 同一窗口内画面显著不同也拆成不同页面', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'rta-engine-'));
+  const source = fakeSource();
+  const engine = createEngine({ source, root, logger: null, autoTick: false, config: CONFIG });
+  const t0 = Date.now();
+  const thumb = (r, g, b) => {
+    const out = new Uint8Array(48 * 27 * 3);
+    for (let i = 0; i < out.length; i += 3) { out[i] = r; out[i + 1] = g; out[i + 2] = b; }
+    return out;
+  };
+  const mkRgb = (r, g, b) => {
+    const rgb = new Uint8Array(16 * 9 * 3);
+    for (let i = 0; i < rgb.length; i += 3) { rgb[i] = r; rgb[i + 1] = g; rgb[i + 2] = b; }
+    return rgb;
+  };
+  const win = { process: 'DeepSeek Harness.exe', title: '同一个窗口' };
+  const ev = (seq, wall, rgb, th) => ({ seq, kind: 'cut', wall, rgb, width: 16, height: 9, win, thumb: th, score: 1 });
+  try {
+    await startEngine(engine, t0);
+    const ring = engine.eventRing;
+    // 同一个窗口标题，但中间两帧画面差异巨大（=在软件内部连续切页）
+    ring.push(ev(1, t0 + 1000, mkRgb(10, 20, 30), thumb(10, 20, 30)));
+    ring.push(ev(2, t0 + 1500, mkRgb(12, 22, 32), thumb(12, 22, 32)));
+    ring.push(ev(3, t0 + 3000, mkRgb(200, 30, 40), thumb(200, 30, 40)));
+    ring.push(ev(4, t0 + 4500, mkRgb(20, 200, 60), thumb(20, 200, 60)));
+
+    const pages = engine.composePages({ minPages: 2, now: t0 + 6000, visualDist: 0.12 });
+    assert.ok(pages, '同窗口内 3 个不同画面应拆成多页');
+    assert.equal(pages.pages.length, 3);
+    assert.deepEqual(pages.pages.map((p) => p.title), ['同一个窗口', '同一个窗口', '同一个窗口']);
+
+    // 视觉阈值调大 → 视为同一页（页面数不足返回 null）
+    const merged = engine.composePages({ minPages: 2, now: t0 + 6000, visualDist: 0.9 });
+    assert.equal(merged, null, '阈值足够大时应合并为同一页');
+    await engine.stop({ reason: 'test' });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

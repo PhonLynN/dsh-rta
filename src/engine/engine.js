@@ -14,7 +14,10 @@
 
 import { EventEmitter } from 'node:events';
 import { createSelector } from '../algo/select.js';
-import { frameToHsv, scorePair, mcRatioScore, meanLuma } from '../algo/color.js';
+import {
+  frameToHsv, scorePair, mcRatioScore, meanLuma,
+  blockDiffFrac, histL1, hueHistogram, pixelChangeFrac, rowMeanProfile, estimateRowShift,
+} from '../algo/color.js';
 import { downscale, downscaleSample } from '../img/scale.js';
 import { bgraToRgb } from '../img/png.js';
 import { planSheet } from '../algo/tiers.js';
@@ -77,6 +80,35 @@ function pageKeyOf(win) {
   return `${win.process ?? ''}|${win.title ?? ''}`;
 }
 
+const THUMB_W = 48;
+const THUMB_H = 27;
+
+/** 事件帧缩略图（48×27 RGB）：用于「同窗口内换页」的视觉聚类，开销很小。 */
+function makeThumb(rgb, width, height) {
+  if (!rgb || !width || !height) return null;
+  const out = new Uint8Array(THUMB_W * THUMB_H * 3);
+  for (let ty = 0; ty < THUMB_H; ty++) {
+    const sy = Math.min(height - 1, Math.floor(((ty + 0.5) * height) / THUMB_H));
+    for (let tx = 0; tx < THUMB_W; tx++) {
+      const sx = Math.min(width - 1, Math.floor(((tx + 0.5) * width) / THUMB_W));
+      const si = (sy * width + sx) * 3;
+      const di = (ty * THUMB_W + tx) * 3;
+      out[di] = rgb[si];
+      out[di + 1] = rgb[si + 1];
+      out[di + 2] = rgb[si + 2];
+    }
+  }
+  return out;
+}
+
+/** 两张页面缩略图的平均绝对差（0–1）；任一缺失时返回 0（视为同一页）。 */
+function thumbDist(a, b) {
+  if (!a || !b || a.length !== b.length) return 0;
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) sum += a[i] > b[i] ? a[i] - b[i] : b[i] - a[i];
+  return sum / (a.length * 255);
+}
+
 /** 创建引擎。参数都可以注入，方便单测/CLI。 */
 export function createEngine(opts = {}) {
   const bus = new EventEmitter();
@@ -107,8 +139,12 @@ export function createEngine(opts = {}) {
   let archiveH = 0;
   let rgbA = null; let rgbB = null;
   let hsvA = null; let hsvB = null;
+  let histA = null; let histB = null;
+  let rowProfA = null; let rowProfB = null;
   let curRgb = null; let prevRgb = null;
   let curHsv = null; let prevHsv = null;
+  let curHist = null; let prevHist = null;
+  let curRowProf = null; let prevRowProf = null;
   let sentinelBuffersFlipped = false;
 
   // 最近事件/存档（内存 ring，只用于"刚发生了什么"的拼图和回捞）
@@ -170,8 +206,12 @@ export function createEngine(opts = {}) {
     rgbB = new Uint8Array(sentinelPixels * 3);
     hsvA = new Float32Array(sentinelPixels * 3);
     hsvB = new Float32Array(sentinelPixels * 3);
+    histA = new Float32Array(40); histB = new Float32Array(40);
+    rowProfA = new Float32Array(sentinelH); rowProfB = new Float32Array(sentinelH);
     curRgb = rgbA; prevRgb = null;
     curHsv = hsvA; prevHsv = null;
+    curHist = histA; prevHist = null;
+    curRowProf = rowProfA; prevRowProf = null;
 
     sessionId = id ?? newSessionId(now);
     store = new SessionStore({
@@ -298,22 +338,35 @@ export function createEngine(opts = {}) {
       return null;
     }
 
-    // 1) 哨兵：采样降采样 → HSV → 分数
+    // 1) 哨兵：采样降采样 → HSV → 分数 + 结构特征
     const sPixels = sentinelW * sentinelH;
     if (sentinelBuffersFlipped) {
       curRgb = rgbA; curHsv = hsvA; prevRgb = rgbB; prevHsv = hsvB;
+      curHist = histA; prevHist = histB; curRowProf = rowProfA; prevRowProf = rowProfB;
     } else {
       curRgb = rgbB; curHsv = hsvB; prevRgb = rgbA; prevHsv = hsvA;
+      curHist = histB; prevHist = histA; curRowProf = rowProfB; prevRowProf = rowProfA;
     }
-    if (stats.ticks === 0) { prevRgb = null; prevHsv = null; }
+    if (stats.ticks === 0) { prevRgb = null; prevHsv = null; prevHist = null; prevRowProf = null; }
     downscaleSample(frame.bgra, frame.width, frame.height, sentinelW, sentinelH, curRgb);
     frameToHsv(curRgb, curHsv);
+    hueHistogram(curHsv, sPixels, curHist);
+    rowMeanProfile(curRgb, sentinelW, sentinelH, curRowProf);
     const score = prevHsv ? scorePair(prevHsv, curHsv, sPixels) : 0;
     const mc = prevRgb ? mcRatioScore(prevRgb, curRgb, sentinelW, sentinelH) : 0;
     const meanV = meanLuma(curRgb);
+    const hist = prevHist ? histL1(prevHist, curHist) : 0;
+    const bFrac30 = prevRgb ? blockDiffFrac(prevRgb, curRgb, sentinelW, sentinelH, { thr: 30 }) : 0;
+    const bFrac15 = prevRgb ? blockDiffFrac(prevRgb, curRgb, sentinelW, sentinelH, { thr: 15 }) : 0;
+    const pixFrac = prevRgb ? pixelChangeFrac(prevRgb, curRgb, sentinelW, sentinelH, 30, 0.5) : 0;
+    const scroll = prevRowProf ? estimateRowShift(prevRowProf, curRowProf, { maxShift: 24 }) : { shift: 0, corr: 0, residRatio: 1 };
 
-    // 2) 选择
-    const decision = selector.ingest({ t: now, score, mc, meanV });
+    // 2) 选择（结构特征让「页面切换 / 滚动 / 视频运动」能被分开）
+    const decision = selector.ingest({
+      t: now, score, mc, meanV,
+      histL1: hist, bFrac30, bFrac15, pixFrac30: pixFrac,
+      shiftPx: Math.abs(scroll.shift), shiftCorr: scroll.corr, scrollResid: scroll.residRatio,
+    });
     if (decision) lastDecision = decision;
 
     // 3) 前台窗口元信息（低频）
@@ -396,6 +449,7 @@ export function createEngine(opts = {}) {
       const ev = {
         id: rec.seq, kind: decision.kind, at: now, wall: now, seq: rec.seq,
         file: rec.file, rgb: frameRgb, width: archiveW, height: archiveH,
+        thumb: makeThumb(frameRgb, archiveW, archiveH),
         regionIds: [],
         win: winMeta(lastForeground),
       };
@@ -417,7 +471,7 @@ export function createEngine(opts = {}) {
     stats.lastTickAt = now;
 
     if (sentinelBuffersFlipped) sentinelBuffersFlipped = false; else sentinelBuffersFlipped = true;
-    return { score, mc, meanV, decision };
+    return { score, mc, meanV, hist, bFrac30, bFrac15, pixFrac, scroll, decision };
   }
 
   /** 基线帧编码器：优先 JPEG（磁盘友好），GDI+ 不可用时退回 PNG。 */
@@ -607,15 +661,18 @@ export function createEngine(opts = {}) {
   }
 
   /**
-   * 把最近的事件按「页面」（process+窗口标题）归并成页面序列，每页取最后一次出现的帧。
-   * 用户 m02213：连续切换多个页面后，模型应该能看到**经过的每一页**，而不是同一页的
-   * 4 张近重复帧。返回 null 表示页面数不足（调用方退回单张 HD 帧）。
+   * 把最近的事件按「页面」归并成页面序列，每页取最后一次出现的帧。
+   * 页面判定 = 窗口身份（process|title）变化 **或** 画面显著不同（缩略图距离）：
+   * 后者覆盖「同一窗口内连续切页」（用户 m02213 的核心场景）。返回 null 表示页面数不足
+   * （调用方退回单张 HD 帧）。
    *
-   * @param {{count?: number, maxTokens?: number, maxAgeMs?: number, minPages?: number, now?: number}} [o]
+   * @param {{count?: number, maxTokens?: number, maxAgeMs?: number, minPages?: number,
+   *          visualDist?: number, now?: number}} [o]
    */
-  function composePages({ count = 8, maxTokens = 700, maxAgeMs = 300_000, minPages = 2, now = Date.now() } = {}) {
+  function composePages({ count = 8, maxTokens = 700, maxAgeMs = 300_000, minPages = 2, visualDist = 0.12, now = Date.now() } = {}) {
     const max = Math.max(1, Math.min(12, Number(count) || 8));
     const floor = Math.max(2, Number(minPages) || 2);
+    const dLimit = Math.max(0.01, Math.min(0.6, Number(visualDist) || 0.12));
     const pool = eventRing.filter((ev) => ev && ev.kind && ev.kind !== 'heartbeat' && ev.kind !== 'integral');
     const pages = [];
     for (const ev of pool) {
@@ -623,10 +680,14 @@ export function createEngine(opts = {}) {
       if (!wall || now - wall > maxAgeMs) continue;
       const key = pageKeyOf(ev.win);
       const last = pages[pages.length - 1];
-      if (last && last.key === key) {
-        last.ev = ev;
-        last.wall = wall;
-        continue;
+      if (last) {
+        const sameWindow = last.key === key;
+        const dist = sameWindow ? thumbDist(last.ev.thumb, ev.thumb) : 1;
+        if (dist < dLimit) {
+          last.ev = ev;
+          last.wall = wall;
+          continue;
+        }
       }
       pages.push({ key, ev, wall });
     }

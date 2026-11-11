@@ -1,4 +1,4 @@
-# RTA — Real Time Accompaniment
+﻿# RTA — Real Time Accompaniment
 
 给 DSH 装一双实时的眼睛和一张嘴：**看见屏幕 → 本地算法筛选 → 只把有信息的画面交给会话模型 → 图片用完即省略、文字长期保留**。
 
@@ -8,7 +8,9 @@
 外加**后台子代理刚写的摘要**（主会话全程不被唤醒）。
 摘要子代理整个会话只用一个常驻 child（新会话绑定后自动起/自动换绑），周期 / 密集事件 / `rta_summarize` 三种触发，`rta_stop` 时清除。
 后端层（采集 / 打分 / 选择 / 拼图 / 录像 / 存储 / 工具）全跑通，
-78 个离线单测全过（10 算法 + 7 引擎 + 7 插件 + 19 注入面 + 14 高清帧 + 19 摘要子代理 + 2 存储）。
+83 个离线单测全过（14 算法 + 8 引擎 + 7 插件 + 19 注入面 + 14 高清帧 + 19 摘要子代理 + 2 存储）。
+切镜判定升级为**结构特征 + 滚动/视频运动分类**：视频播放、滚动、同一窗口内连续切页不再混为一谈
+（真实录像回放：低动态视频的误报 cut 10 → 0，真实窗口/页面切换仍有 7/90s 的覆盖率）。
 UI/UX（悬浮窗、对话 / 轨迹面板、插件配置页）按计划放在下一阶段。
 
 平台：Windows 10/11（GDI + koffi 调 Win32）。插件侧只依赖 `@deepseek-ai/dsh-tools`（可选）。
@@ -71,7 +73,7 @@ RTA 的做法：**本地永远在采集，但只有通过筛选的画面才进�
 
 快速在多个页面/窗口之间切换时，单张 HD 帧只能留下最后停住的那一页，中间经过的页面会被漏掉。多页拼图专门补这个洞：
 
-- **页面归并**：事件入环形缓冲时带上窗口元信息（`win{title,process,rect}`）；`engine.composePages()` 把最近 `montageMaxAgeMs=120000` 内的事件按 `pageKey = process|title` 归并，连续停留在同一页只留最后一帧，因此「A→B→C→B」得到 A/B/C 三格而不是四格重复。
+- **页面归并**：事件入环形缓冲时带上窗口元信息（`win{title,process,rect}`）和 48×27 缩略图；`engine.composePages()` 把最近 `montageMaxAgeMs=120000` 内的事件归并成页面序列——**窗口身份（`pageKey = process|title`）变化**、或同一窗口内画面差异超过 `montageVisualDist=0.12`（缩略图平均绝对差 0–1）都算换页，因此「同一软件内连续切页」也能被拆开；连续停留在同一页只留最后一帧（A→B→C→B 得到 A/B/C 三格而不是四格重复）。
 - **触发**：`lifecycle.screenshotFor` 每轮首步先试多页拼图；只有窗口内页面数 ≥ `montageMinPages=3` 才发，否则退回单张裁窗 HD 帧（避免偶尔切一次页就把可读的大图换成小格子图）。
 - **出图**：最多 `montageFrames=8` 格、`montageMaxTokens=700`（八格 1260×756 ≈560 tokens），每格贴时间戳标签；caption 标题为「〔RTA 多页截图 · 插件注入，非用户消息〕」，并逐行列出「1. 14:32:10 标题」方便模型引用。
 - **回落**：无多页时依次走单帧 HD → 事件环形缓冲拼图（`composePages` → `composeRecent`），caption 与 `summary` 按 mode 标注，三种来源不会混。
@@ -97,9 +99,11 @@ src/
   capture/gdi.js       采集 provider（grab / cursor / foreground / keyDown）
   img/png.js           零依赖 PNG 编码（BGRA→RGB，level 3）
   img/scale.js         下采样（box / 四分位采样）、裁剪
-  algo/color.js        HSV 变换、帧差分打分、运动补偿 mc、亮度增益
+  algo/color.js        HSV 变换、帧差分打分、运动补偿 mc、亮度增益、40 段色相直方图、
+                       分块差占比、整帧像素变化占比、行亮度投影位移估计（滚动可解释度）
   algo/rolling.js      滑动分位数（z-score、自适应阈值）
-  algo/select.js       四闸门选择器：cut / integral / text / heartbeat + 预算
+  algo/select.js       四闸门选择器：cut / integral / text / heartbeat + 预算；
+                       结构特征区分「切镜 / 滚动 / 视频运动」，持续运动时自动抬高 cut 门槛
   algo/tiers.js        拼图档位与 token 估算（42px 网格）
   algo/pack.js         拼图合成：贴帧、圈画红框、帧标签
   algo/regions.js      鼠标轨迹圈画 → bbox / 时间区间
@@ -124,9 +128,11 @@ test/                  node --test，零依赖
 ## 算法管线
 
 1. **抓取**：每 tick 一次 GDI `BitBlt` 原图（本机 2560×1440 约 22 ms），JS 下采样到 192×108 做哨兵（约 0.3 ms）；按 `archiveFps` 另存 512px 档案帧。默认 `sentinelHz=15`，一次抓取同时供哨兵和档案，CPU ≈ 0.3–0.4 核。
-2. **打分**：HSV 加权差分（色相环形距离、饱和度做权重）+ 亮度增益 + 运动补偿 `mcRatioScore`（±2 邻域匹配，整帧平移≈0）+ 滚动 z-score（窗口 300 帧、直方图分位）。
+2. **打分**：HSV 加权差分（色相环形距离、饱和度做权重）+ 亮度增益 + 运动补偿 `mcRatioScore`（±2 邻域匹配，整帧平移≈0）+ 滚动 z-score（窗口 300 帧、直方图分位）。同一帧顺带算结构特征：40 段色相直方图 L1、8×8 块亮度差占比（`bFrac30/15`）、整帧像素变化占比、行亮度投影的位移/相关性/残差（判断「滚动」此时序是否能被位移解释）。
 3. **选择**（四路取并集，互不否决）：
-   - `cut`：`score ≥ 12 && z ≥ 3 && mc ≥ 0.2 && 距上次 ≥ 400ms`
+   - `cut`：`score ≥ 12 && z ≥ 3 && mc ≥ 0.2 && 距上次 ≥ 400ms`，并追加结构闸门：
+     **不是滚动**（位移可解释、补偿后残差低则降级为 integral）、**是版面级变化**（`bFrac30 ≥ 0.40 || histL1 ≥ 0.20`）；
+     最近 1 秒多数帧都在动（视频在播）时抬到 `bFrac30 ≥ 0.60 && histL1 ≥ 0.35 && mc ≥ 0.45`，只有真正的整版换页能触发。
    - `integral`：静默期累积变化 ≥ 阈值（正在持续变化但不是切镜）
    - `text`：文字变化（字幕 / OCR）是硬信号，优先触发
    - `heartbeat`：最长 25 s 静默必给一帧保险帧
@@ -201,7 +207,8 @@ test/                  node --test，零依赖
       "montageMinPages": 3,
       "montageFrames": 8,
       "montageMaxTokens": 700,
-      "montageMaxAgeMs": 120000
+      "montageMaxAgeMs": 120000,
+      "montageVisualDist": 0.12
     },
     "summarizer": {
       "enabled": true,
@@ -222,7 +229,7 @@ test/                  node --test，零依赖
 ## 开发 / 自测
 
 ```bash
-node --test test/*.test.mjs        # 78 个离线测试，不抓屏（宿主/沙箱里 spawn 受限时逐文件跑）
+node --test test/*.test.mjs        # 83 个离线测试，不抓屏（宿主/沙箱里 spawn 受限时逐文件跑）
 node test/live.test.mjs            # 只跑注入面（live-buffer / injector / channel / lifecycle）
 node test/hd.test.mjs              # 只跑高清帧通道（选帧 / 裁剪 / 缩图 / vf 生成）
 node test/summarizer.test.mjs      # 只跑后台摘要子代理（prompt / delivery / 节流 / 失败路径）
