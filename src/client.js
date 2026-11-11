@@ -721,16 +721,12 @@ window.__ModuleLoader__.load({
       let current = null;
 
       // Electron 全局浮窗模式（ui/overlay/window.html 注入 __RTA_OVERLAY__）：
-      // 窗口是透明置顶窗（无系统材质）。两种模糊后端：
-      //  - 液态玻璃面板（window.__RTA_GLASS__，main.cjs 用 @hicccc77 的 D3D11 面板垫在窗口下）：
-      //    渲染层什么都不用画，只保留设计稿图层 → 设计值与 pen 导出完全一致，零近似。
+      // 窗口是透明置顶窗（无系统材质）；模糊由 startLiveBackdrop() 的采集背板提供。
       //  - 渲染层采集（回退）：startLiveBackdrop() 抓前台窗口 → canvas 预模糊 → 垫在设计稿渐变下。
       const OVERLAY = typeof window !== 'undefined' && window.__RTA_OVERLAY__ === true;
-      const GLASS_PANEL = typeof window !== 'undefined' && window.__RTA_GLASS__ === true;
       const nativeBridge = OVERLAY && typeof window !== 'undefined' ? window.__rtaOverlay : null;
       if (OVERLAY) root.classList.add('rta-overlay');
-      if (GLASS_PANEL) root.classList.add('rta-glass-panel');
-      const liveBackdrop = OVERLAY && !GLASS_PANEL ? startLiveBackdrop(root) : null;
+      const liveBackdrop = OVERLAY ? startLiveBackdrop(root) : null;
 
       // 位置记忆（拖动后保存）；默认按设计稿在 1280 宽画布上的落点换算成右侧 100 / 顶部 88
       if (OVERLAY) {
