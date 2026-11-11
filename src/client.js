@@ -94,9 +94,9 @@ window.__ModuleLoader__.load({
 #${ROOT_ID} .rta-hidden{display:none !important}
 #${ROOT_ID}.rta-overlay{position:fixed;inset:0;overflow:hidden}
 #${ROOT_ID}.rta-overlay .rta-win{position:absolute;inset:0;width:auto;display:block;gap:0}
-#${ROOT_ID}.rta-overlay .rta-card{position:absolute;left:20px}
-#${ROOT_ID}.rta-overlay .rta-card--messages{top:20px}
-#${ROOT_ID}.rta-overlay .rta-card--composer{top:554px}
+#${ROOT_ID}.rta-overlay .rta-card{position:absolute;left:40px}
+#${ROOT_ID}.rta-overlay .rta-card--messages{top:40px}
+#${ROOT_ID}.rta-overlay .rta-card--composer{top:574px}
 #${ROOT_ID}.rta-overlay .rta-pill-mini{left:16px;top:16px;right:auto;bottom:auto}
 #${ROOT_ID} .rta-btn,#${ROOT_ID} .rta-send,#${ROOT_ID} .rta-input input{-webkit-app-region:no-drag}
 /* 独立透明窗口没有可采样的背景：不做采集、不做 backdrop-filter。 */

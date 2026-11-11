@@ -8,7 +8,7 @@
  *  - 自反馈：默认不开内容保护（远程桌面本身也是抓屏，开了用户就看不到浮窗）；
  *    需要时可用 DSH_RTA_OVERLAY_CP=1 打开 setContentProtection 做本机调试。
  *  - 热重载：再启动一次浮窗（拿不到单实例锁）会触发已有实例 reload，样式改动无需重启 RTA。
- *  - 一个窗口装两张卡（420×520 + 420×98 + 14 gap），四周 20px 给设计稿外阴影；
+ *  - 一个窗口装两张卡（420×520 + 420×98 + 14 gap），四周 40px 是窗口内边距（只给设计稿外阴影留空间，不改变卡片间距）；
  *    卡外空白/缝隙点击穿透。
  */
 
@@ -54,7 +54,7 @@ const TOKEN = process.env.RTA_OVERLAY_TOKEN || '';
 const CARD_MESSAGES = { width: 420, height: 520 };
 const CARD_COMPOSER = { width: 420, height: 98 };
 const CARD_GAP = 14;
-const PAD = 20; // 设计稿外阴影 blur 20 / offset 6，四周留 20px 才画得下
+const PAD = 40; // 窗口内边距（只给外阴影留空间，不是卡片间距；CARD_GAP 仍是 14）。设计外阴影 blur 20 + 下偏移 6，Chromium 尾部约 3σ≈30px，20px 会被窗口边界裁成直边
 const WIN_WIDTH = CARD_MESSAGES.width + PAD * 2; // 460
 const WIN_HEIGHT = PAD + CARD_MESSAGES.height + CARD_GAP + CARD_COMPOSER.height + PAD; // 672
 
