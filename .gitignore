@@ -1,0 +1,25 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build / runtime artifacts
+out/
+dist/
+*.tsbuildinfo
+*.log
+
+# local probe & experiment workspace (large screenshots, node_modules, logs)
+_probe/
+
+# stray local debug captures
+/crop_chat.png
+/crop_modal.png
+/reg_a.png
+/reg_b.png
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

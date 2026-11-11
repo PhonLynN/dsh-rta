@@ -1,0 +1,41 @@
+{
+  "name": "dsh-rta",
+  "version": "0.1.0",
+  "description": "RTA (Real Time Accompaniment) — 实时屏幕陪伴：看得见、圈得出、记得住。DeepSeek Harness 插件。",
+  "type": "module",
+  "private": true,
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": "./src/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "scripts",
+    "ui/overlay",
+    "dsh.plugin.json",
+    "cordis.patch.yml",
+    "README.md",
+    "NOTICE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "dev": "node bin/rta-run.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.7"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  }
+}

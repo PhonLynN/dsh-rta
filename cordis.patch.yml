@@ -1,0 +1,5 @@
+# RTA 作为 bundle 装载时插进 cordis 组合的那一行。
+# 参考 dsh-video-storyboard 的写法：insert 一条按 id/name 定位的加载项。
+- insert:
+    - id: dsh-rta
+      name: dsh-rta

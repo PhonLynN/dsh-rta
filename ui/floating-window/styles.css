@@ -1,0 +1,192 @@
+/* RTA floating window — shell + behavior styles.
+ *
+ * Fidelity rule: every design value (size / material / radius / font / icon /
+ * spacing) lives in index.html as the pen.dev exporter wrote it. This file only
+ * adds what the static design frame cannot express: page shell, the real text
+ * input, scroll area, drag state and the collapsed pill. Those use design tokens
+ * from the same file (--rta-*), never hard-coded guesses. */
+
+@font-face {
+  font-family: "Noto Sans SC";
+  src: url("assets/NotoSansSC-VF.ttf") format("truetype");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: block;
+}
+
+:root {
+  --rta-bg: #151517;
+  --rta-layer-1: #232324;
+  --rta-layer-2: #2c2c2e;
+  --rta-layer-3: #353638;
+  --rta-border: #ffffff1f;
+  --rta-border-soft: #ffffff0f;
+  --rta-text: #f9fafb;
+  --rta-text-2: #cfd3d6;
+  --rta-text-3: #adb2b8;
+  --rta-text-4: #81858c;
+  --rta-blue: #7aaaff;
+  --rta-green: #22c55e;
+}
+
+*, ::before, ::after {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+}
+
+body {
+  position: relative;
+  font-family: "Noto Sans SC", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Transparent host layer: the window floats over whatever the host paints.
+ * The design frame's desktop screenshot + scrim belong to the mock environment,
+ * NOT to the window. */
+#stage {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  background: transparent;
+}
+
+
+.rta-window {
+  position: absolute;
+  left: 120px;
+  top: 80px;
+  width: 420px;
+  height: 632px;
+  z-index: 2;
+}
+
+.rta-window.is-dragging {
+  user-select: none;
+}
+
+/* Header is the drag handle: the first 420x24 row of the messages content. */
+.rta-window [data-pencil-name="Header"] {
+  cursor: grab;
+}
+
+.rta-window.is-dragging [data-pencil-name="Header"] {
+  cursor: grabbing;
+}
+
+.rta-window [data-pencil-name="Collapse"] {
+  cursor: pointer;
+}
+
+.rta-window [data-pencil-name="Conversation Switch"] {
+  cursor: pointer;
+}
+
+/* Messages: the static frame has no overflow; real chat needs a scroll area.
+ * Hide the scrollbar so the 420-wide message column stays exact. */
+.rta-window [data-pencil-name="Messages"] {
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: none;
+  overscroll-behavior: contain;
+}
+
+.rta-window [data-pencil-name="Messages"]::-webkit-scrollbar {
+  display: none;
+}
+
+/* Real text field replacing the design placeholder: identical type metrics,
+ * transparent chrome, native caret. */
+.chat-input {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 23px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--rta-text);
+  font-family: "Noto Sans SC", system-ui, sans-serif;
+  font-size: 16px;
+  font-weight: 400;
+  line-height: normal;
+  letter-spacing: 0;
+}
+
+.chat-input::placeholder {
+  color: var(--rta-text-4);
+  opacity: 1;
+}
+
+/* Clickable chrome */
+.rta-window [data-pencil-name="Send"],
+.rta-window [data-pencil-name="Add Button"] {
+  cursor: pointer;
+}
+
+.rta-window [data-pencil-name="Send"] {
+  border: 0;
+  padding: 0;
+}
+
+/* Collapsed state: same material tokens as the window (hairline border, 0f
+ * white fill, 999 radius) so it reads as the same object. */
+.mini-pill {
+  position: fixed;
+  right: 100px;
+  bottom: 88px;
+  z-index: 20;
+  display: none;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border: 1px solid var(--rta-border);
+  border-radius: 999px;
+  background: var(--rta-layer-1);
+  box-shadow: 0 6px 20px #0000004d, inset 0 1px 0 #ffffff12;
+  color: var(--rta-text-2);
+  font-family: "Noto Sans SC", system-ui, sans-serif;
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.mini-pill__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--rta-green);
+}
+
+.mini-pill__label {
+  color: var(--rta-text);
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+}
+
+.mini-pill__time {
+  color: var(--rta-text-4);
+  font-variant-numeric: tabular-nums;
+}
+
+body.is-collapsed .rta-window {
+  display: none;
+}
+
+body.is-collapsed .mini-pill {
+  display: inline-flex;
+}
+
+/* While the window is being dragged, keep the cursor consistent. */
+body.is-dragging,
+body.is-dragging * {
+  cursor: grabbing !important;
+}

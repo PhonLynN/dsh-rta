@@ -1,0 +1,9 @@
+{
+  "name": "dsh-rta",
+  "description": "RTA（Real Time Accompaniment）实时屏幕陪伴：看得见、圈得出、记得住。",
+  "version": "0.1.0",
+  "entry": {
+    "name": "dsh-rta",
+    "inject": ["tools"]
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "name": "dsh-rta-overlay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "RTA 全局浮窗（独立 Electron 进程，由 dsh-rta 服务端插件在启用 RTA 时拉起）",
+  "main": "main.cjs"
+}

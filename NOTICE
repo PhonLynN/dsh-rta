@@ -1,0 +1,20 @@
+dsh-rta — Real Time Accompaniment
+Copyright 2026 dsh-rta contributors
+
+This product includes software adapted from dsh-video-storyboard:
+
+  dsh-video-storyboard
+  Copyright 2026 SAOS-3624
+  https://github.com/SAOS-3624/dsh-video-storyboard
+  Licensed under the Apache License, Version 2.0
+
+Adapted portions (rewritten for RTA's host-plugin layer, not copied verbatim):
+  - src/host/define-tool.js       — the defineTool fallback (property-map -> JSON Schema)
+  - src/host/offload.js           — image/offload planning and application
+  - src/host/service.js           — serviceOf() lookup and attachment hand-off
+  - src/host/runtime.js           — tool registration / disposal shape
+  - src/algo/color.js, rolling.js, select.js, tiers.js, pack.js
+                                  — screening and sheet-packing algorithms informed by
+                                    the storyboard scanner (constants and gate structure)
+
+The Apache License 2.0 text is included in LICENSE.

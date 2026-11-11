@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>RTA</title>
+  <style>
+    /* 透明窗口：桌面内容透过来，卡片自身的玻璃材质由 src/client.js 的样式负责。
+       默认整页 no-drag，只有消息卡 header 在 client.js 里显式设为 drag（拖动整组窗口）。 */
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; -webkit-app-region: no-drag; }
+    body { font-family: "Noto Sans SC", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif; }
+    /* 原生拖动区里的交互控件不能拖（header 本身在 client.js 里设为 drag） */
+    #dsh-rta-float .rta-btn,
+    #dsh-rta-float .rta-pill,
+    #dsh-rta-float .rta-switch,
+    #dsh-rta-float .rta-mode,
+    #dsh-rta-float .rta-send,
+    #dsh-rta-float input { -webkit-app-region: no-drag; }
+    #rta-overlay-error {
+      margin: 20px; padding: 12px 14px; border-radius: 12px;
+      background: rgba(40, 12, 12, .92); color: #ffb4b4;
+      font: 13px/1.5 "Microsoft YaHei UI", system-ui, sans-serif; white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <script>
+    // 透明置顶窗：一个窗口装两张卡，卡片由 client.js 按设计稿图层绘制。
+    window.__RTA_OVERLAY__ = true; // 让 client.js 走 overlay 布局（卡片定位在 20/20 与 20/554）
+    const params0 = new URLSearchParams(location.search);
+    window.__RTA_CARD__ = params0.get('card') || null;
+    // 复用给 DSH 页面写的客户端 bundle：这里只需要它的工厂函数，不需要宿主 ModuleLoader。
+    window.__ModuleLoader__ = {
+      entries: {},
+      load(spec) { window.__RTA_SPEC__ = spec; },
+    };
+    const params = new URLSearchParams(location.search);
+    if (params.get('endpoint')) window.__RTA_ENDPOINT__ = params.get('endpoint');
+    if (params.get('token')) window.__RTA_TOKEN__ = params.get('token');
+  </script>
+  <script src="../../src/client.js"></script>
+  <script>
+    (function boot() {
+      try {
+        const spec = window.__RTA_SPEC__;
+        if (!spec || typeof spec.factory !== 'function') throw new Error('src/client.js 没有注册 dsh-rta 工厂');
+        const exports = spec.factory(() => { throw new Error('overlay 模式下不提供 module require'); });
+        const ctx = {
+          // cordis 语义：effect(fn) 立即执行 fn，fn 的返回值才是 disposer。
+          effect(fn) {
+            const dispose = fn();
+            window.__RTA_DISPOSE__ = dispose;
+            return dispose;
+          },
+          get() { return null; },
+          logger: console,
+        };
+        exports.apply(ctx);
+      } catch (err) {
+        const box = document.createElement('div');
+        box.id = 'rta-overlay-error';
+        box.textContent = `RTA 浮窗启动失败：${err && err.message ? err.message : err}`;
+        document.body.appendChild(box);
+      }
+    })();
+  </script>
+</body>
+</html>
